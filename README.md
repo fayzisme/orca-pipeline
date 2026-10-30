@@ -1,29 +1,40 @@
 # orca-pipeline
 
-Run a feature or bug fix through three coding agents in
-[Orca](https://www.onorca.dev) ([source](https://github.com/stablyai/orca)),
-with you in control of every decision that matters.
+One command takes a task from plan to reviewed code, using several AI coding
+agents in [Orca](https://www.onorca.dev). You approve the important steps.
+
+```bash
+orca-dev my-app fix invoice-rounding "Invoice totals round the wrong way"
+```
+
+## Why
+
+[Orca](https://github.com/stablyai/orca) runs many coding agents side by side,
+but you still coordinate them yourself. You write the plan prompt, wait, pass
+the result to the next agent, start the review, read it, send fixes back, and
+decide when to ship. That hand-off work is slow and easy to get wrong. Agents
+also often skip the project's own test commands, rules, and skills.
+
+## What it does
+
+- Runs each task through fixed stages: **plan**, **implement**, **review** (with
+  automatic fix rounds), and **ship**.
+- Gives each stage to an agent. By default, Claude Code plans, OpenCode
+  implements, and Codex reviews. Any agent that Orca supports can take any stage.
+- Tells every agent which skills, test commands, and project rules to use, from
+  one configuration file per project.
+- Stops for your approval after the plan, and before anything is committed or
+  pushed.
+
+## Goal
+
+Let a script do the coordination, and keep the decisions with you. Every change
+is planned before it's written, reviewed by a different agent than the one that
+wrote it, and tested the way the project expects.
 
 This is an independent community project built on Orca's public CLI. It isn't
 affiliated with or endorsed by the Orca team. For Orca itself, see the
 [official documentation](https://www.onorca.dev/docs).
-
-By default:
-
-- **Claude Code** plans and designs the change.
-- **OpenCode** implements the plan.
-- **Codex** reviews the change, runs the tests, and optionally runs end-to-end
-  checks.
-- When the review passes, Codex can commit, push, and open a pull request, but
-  only after you approve it.
-
-These are only defaults. Any agent that Orca can launch can take any stage, you
-can add your own agents and model aliases, and several agents can review in
-parallel. See [Agents](#agents).
-
-Each agent loads the skills that fit the task (for example a debugging skill for
-a bug fix, or a security review skill for login code), and each project gets its
-own configuration for test commands, rules, and URLs.
 
 ## Contents
 
