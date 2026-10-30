@@ -1,0 +1,19 @@
+# Local project configurations, onboarding reports, and logs: they hold local paths
+# and project details.
+projects/
+local-reference.json
+
+# Python and logs
+__pycache__/
+*.pyc
+*.log
+
+# Never commit database dumps or secrets
+*.sql
+*.dump
+*.sqlite
+*.sqlite3
+*.psql
+*.db
+.env
+.env.*

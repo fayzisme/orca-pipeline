@@ -1,0 +1,159 @@
+{
+  "project": "my-app",
+  "path": "~/code/my-app",
+  "test_command": "docker exec -w /var/www/html my-app vendor/bin/phpunit tests/",
+  "test_commands": {
+    "implement": "docker exec -w /var/www/html my-app vendor/bin/phpunit tests/<TestFile>.php (only the test files the plan names; never the full suite)",
+    "review": "docker exec -w /var/www/html my-app vendor/bin/phpunit tests/ (full suite, once)"
+  },
+  "known_failures": "none",
+  "plan_dir": "docs/plans",
+  "review_dir": "docs/reviews",
+  "stage_timeout_min": 40,
+  "max_fix_rounds": 2,
+  "answer_questions": "ask_me",
+  "question_timeout_min": 15,
+  "gates": {
+    "after_plan": true,
+    "after_failure": true,
+    "before_fix": false
+  },
+  "board": {
+    "enabled": true,
+    "in_progress": "in-progress",
+    "in_review": "in-review",
+    "done": "completed"
+  },
+  "agents": {
+    "plan": "claude",
+    "implement": "opencode",
+    "review": "codex",
+    "e2e": "codex",
+    "ship": "codex"
+  },
+  "e2e": {
+    "enabled": false,
+    "base_url": "http://my-app.local",
+    "modules": {
+      "admin": "/admin",
+      "reports": "/reports"
+    },
+    "login_note": "Read the test user from the environment variables MY_APP_E2E_USER and MY_APP_E2E_PASSWORD; if they are not set, ask the coordinator instead of guessing. Do not create, approve, or delete real records: only open pages, fill forms, and stop before the final submit unless the plan names a safe test record.",
+    "skills": [
+      "e2e-test-runner"
+    ],
+    "files_dir": "tests/e2e"
+  },
+  "ship": {
+    "enabled": true,
+    "skills": [
+      "your-pr-skill"
+    ],
+    "base_branch": "staging",
+    "follow_review": false,
+    "timeout_min": 30
+  },
+  "modes": {
+    "small": {
+      "plan": [
+        "dev-workflow:dev-workflow"
+      ],
+      "implement": [
+        "implement-plan",
+        "laravel-expert",
+        "php-laravel-codestyle"
+      ],
+      "review": [
+        "caveman-review"
+      ]
+    },
+    "bugfix": {
+      "plan": [
+        "dev-workflow:dev-workflow",
+        "superpowers:systematic-debugging"
+      ],
+      "implement": [
+        "surgical-patch",
+        "laravel-expert",
+        "tdd-checklist"
+      ],
+      "review": [
+        "caveman-review",
+        "bmad-review-edge-case-hunter"
+      ]
+    },
+    "ui": {
+      "plan": [
+        "dev-workflow:dev-workflow",
+        "bmad-ux",
+        "html-css-responsive"
+      ],
+      "implement": [
+        "implement-plan",
+        "laravel-expert",
+        "html-css-responsive"
+      ],
+      "review": [
+        "caveman-review"
+      ]
+    },
+    "secure": {
+      "plan": [
+        "dev-workflow:dev-workflow",
+        "security-best-practices"
+      ],
+      "implement": [
+        "implement-plan",
+        "laravel-expert",
+        "php-laravel-codestyle",
+        "tdd-checklist"
+      ],
+      "review": [
+        "bmad-code-review",
+        "security-best-practices"
+      ]
+    },
+    "large": {
+      "plan": [
+        "dev-workflow:dev-workflow",
+        "bmad-create-prd",
+        "bmad-create-architecture",
+        "bmad-create-epics-and-stories"
+      ],
+      "implement": [
+        "bmad-dev-story",
+        "laravel-expert",
+        "php-laravel-codestyle",
+        "tdd-checklist"
+      ],
+      "review": [
+        "bmad-code-review",
+        "bmad-review-edge-case-hunter"
+      ]
+    },
+    "scratch": {
+      "plan": [
+        "bmad-product-brief",
+        "bmad-create-prd",
+        "bmad-create-architecture",
+        "bmad-create-epics-and-stories"
+      ],
+      "implement": [
+        "bmad-dev-story",
+        "laravel-expert",
+        "php-laravel-codestyle"
+      ],
+      "review": [
+        "bmad-code-review",
+        "bmad-qa-generate-e2e-tests"
+      ]
+    }
+  },
+  "extra_rules": {
+    "plan": "Name the exact test files to add or run, and the URL path for the end-to-end check.",
+    "implement": "Run php, artisan, composer, and phpunit only inside the my-app container, never with the host toolchain. Tests share the application database: tests must not write to it. Never run migrations, seeders, or SQL that changes data.",
+    "review": "Run PHPUnit only inside the my-app container. A failing test is blocking only when it covers code changed in the diff; otherwise list it as a pre-existing follow-up. Flag as blocking any new test that writes to the database.",
+    "ship": "Commit messages follow Conventional Commits. The PR body says which tests ran and which URL was checked.",
+    "e2e": "The app runs at my-app.local. If a request hangs, use 127.0.0.1 with the header Host: my-app.local."
+  }
+}
