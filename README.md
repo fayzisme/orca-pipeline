@@ -35,6 +35,7 @@ own configuration for test commands, rules, and URLs.
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
 - [References](#references)
+- [License](#license)
 
 ## How it works
 
@@ -540,3 +541,7 @@ Agent and tool documentation:
 - [Codex CLI](https://github.com/openai/codex)
 - [GitHub CLI](https://cli.github.com)
 - [Mermaid](https://mermaid.js.org), for the diagrams in this README
+
+## License
+
+[MIT](LICENSE)
