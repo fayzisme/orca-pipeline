@@ -1,7 +1,12 @@
 # orca-pipeline
 
-Run a feature or bug fix through three coding agents in [Orca](https://github.com/stablyai/orca),
+Run a feature or bug fix through three coding agents in
+[Orca](https://www.onorca.dev) ([source](https://github.com/stablyai/orca)),
 with you in control of every decision that matters.
+
+This is an independent community project built on Orca's public CLI. It isn't
+affiliated with or endorsed by the Orca team. For Orca itself, see the
+[official documentation](https://www.onorca.dev/docs).
 
 - **Claude Code** plans and designs the change.
 - **OpenCode** implements the plan.
@@ -29,6 +34,7 @@ own configuration for test commands, rules, and URLs.
 - [Files](#files)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
+- [References](#references)
 
 ## How it works
 
@@ -72,7 +78,8 @@ flowchart LR
 
 - `zsh`, `git`, and Python 3 (tested with Python 3.12 on macOS). The scripts use
   the Python standard library only.
-- [Orca](https://github.com/stablyai/orca) with its `orca` CLI, running.
+- [Orca](https://www.onorca.dev/docs/install) with its `orca` CLI, running.
+  See the [CLI overview](https://www.onorca.dev/docs/cli/overview).
 - The agent CLIs you configure, signed in: `claude` (Claude Code), `opencode`,
   and `codex`. Orca must be able to launch each one.
 - For the ship stage: `gh` (GitHub CLI), signed in, a GitHub remote named
@@ -388,7 +395,10 @@ After a run:
 ## Why this works with Orca
 
 Orca provides the building blocks. The coordinator combines them into a fixed
-order, with gates in between.
+order, with gates in between. The official
+[orchestration guide](https://www.onorca.dev/docs/cli/orchestration) and
+[CLI reference](https://www.onorca.dev/docs/cli/reference) describe each
+command in full.
 
 | Need | Orca command | Used by |
 | --- | --- | --- |
@@ -495,3 +505,38 @@ The pipeline writes these files inside each project:
   `ship.skills`. No such skill is part of this repository (the example names a
   placeholder, `your-pr-skill`), so bring your own or turn the stage off. It also needs the GitHub
   CLI. For other hosting, set `"ship": {"enabled": false}` and commit by hand.
+
+## References
+
+Orca, the official sources:
+
+- [Orca website](https://www.onorca.dev) and
+  [documentation](https://www.onorca.dev/docs)
+- [Source code on GitHub](https://github.com/stablyai/orca),
+  [releases](https://github.com/stablyai/orca/releases), and
+  [changelog](https://www.onorca.dev/changelog)
+- [Install Orca](https://www.onorca.dev/docs/install)
+- [CLI overview](https://www.onorca.dev/docs/cli/overview) and
+  [CLI reference](https://www.onorca.dev/docs/cli/reference)
+- [Orchestration](https://www.onorca.dev/docs/cli/orchestration): runs,
+  workers, messages, and the coordinator loop this project builds on
+- [Skills](https://www.onorca.dev/docs/cli/skills)
+- [Worktrees](https://www.onorca.dev/docs/model/worktrees)
+- [Supported agents](https://www.onorca.dev/docs/agents/supported)
+- [Running agents in parallel](https://www.onorca.dev/docs/recipes/parallel-agents)
+- [Community plugins](https://github.com/stablyai/orca-community-plugins)
+
+The installed `orca` CLI also carries a guide that matches its version. Print it
+with:
+
+```bash
+orca skills get orca-cli
+```
+
+Agent and tool documentation:
+
+- [Claude Code](https://code.claude.com/docs/en/overview)
+- [OpenCode](https://opencode.ai/docs)
+- [Codex CLI](https://github.com/openai/codex)
+- [GitHub CLI](https://cli.github.com)
+- [Mermaid](https://mermaid.js.org), for the diagrams in this README
