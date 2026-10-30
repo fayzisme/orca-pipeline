@@ -35,6 +35,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import orca_pipeline  # noqa: E402
 import validate_config  # noqa: E402
 
 HOME = os.path.expanduser("~")
@@ -223,8 +224,18 @@ def hostname_facts(name):
     return {"local_hosts_in_etc_hosts": sorted(candidates & hosts)}
 
 
+def agent_facts():
+    """Every agent profile (agents.json, agents.local.json, the reference's agent_profiles),
+    with whether its CLI is installed here."""
+    with open(EXAMPLE) as f:
+        profiles = orca_pipeline.load_agent_profiles(json.load(f))
+    return {name: {"orca_id": p.get("orca_id", name), "model": p.get("model"),
+                   "cli_installed": bool(p.get("cli") and shutil.which(p["cli"]))}
+            for name, p in profiles.items()}
+
+
 def skill_facts(path):
-    """Visibility of every skill the reference config uses, per agent."""
+    """Visibility of every skill the reference config uses, for every agent profile."""
     with open(EXAMPLE) as f:
         example = json.load(f)
     names = {s for mode in example["modes"].values() for stage in mode.values() for s in stage}
@@ -232,8 +243,10 @@ def skill_facts(path):
     names |= set(example.get("ship", {}).get("skills", []))
     names |= {"bmad-build", "implement-plan", "dev-workflow:dev-workflow", "nodejs-codestyle",
               "superpowers:systematic-debugging", "superpowers:requesting-code-review"}
-    return {agent: sorted(n for n in names if validate_config.skill_visible(agent, n, path))
-            for agent in ("claude", "opencode", "codex")}
+    profiles = orca_pipeline.load_agent_profiles(example)
+    return {agent: sorted(n for n in names
+                          if validate_config.skill_visible(agent, n, path, profiles))
+            for agent in profiles}
 
 
 def vault_facts(path):
@@ -258,7 +271,8 @@ def collect_facts(path, name):
             "under_sites": path.startswith(f"{HOME}/Sites/"),
             "git": git_facts(path), "stack": stack_facts(path),
             "runtime": runtime_facts(path), "hosts": hostname_facts(name),
-            "dev_server": dev_server_facts(path), "skills_visible": skill_facts(path),
+            "dev_server": dev_server_facts(path), "agents": agent_facts(),
+            "skills_visible": skill_facts(path),
             "vault": vault_facts(path)}
 
 

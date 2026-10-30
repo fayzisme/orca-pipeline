@@ -23,20 +23,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import orca_pipeline  # noqa: E402  (shared resolve_base)
 
 HOME = os.path.expanduser("~")
-KNOWN_AGENTS = ("claude", "opencode", "codex")
 STAGES = ("plan", "implement", "review")
 
 
-def skill_dirs(agent, project):
-    """Folders that hold <skill>/SKILL.md for each agent, global first, then the project."""
-    if agent == "claude":
-        roots = [f"{HOME}/.claude/skills", f"{project}/.claude/skills"]
-    elif agent == "opencode":
-        roots = [f"{HOME}/.config/opencode/skills", f"{HOME}/.claude/skills",
-                 f"{HOME}/.agents/skills", f"{project}/.opencode/skills",
-                 f"{project}/.claude/skills", f"{project}/.agents/skills"]
-    else:  # codex
-        roots = [f"{HOME}/.agents/skills", f"{HOME}/.codex/skills", f"{project}/.agents/skills"]
+def skill_dirs(profile, project):
+    """Existing folders from a profile's skill_dirs, with "~" and "{project}" expanded."""
+    roots = [os.path.expanduser(d.replace("{project}", project or "."))
+             for d in profile.get("skill_dirs", [])]
     return [r for r in roots if os.path.isdir(r)]
 
 
@@ -48,11 +41,16 @@ def plugin_skill_exists(name):
     return any(glob.glob(p) for p in patterns)
 
 
-def skill_visible(agent, name, project):
-    if agent == "claude" and ":" in name:
+def skill_visible(agent, name, project, profiles=None):
+    """True when the agent's profile can see the skill. None when the agent has no profile,
+    so the skill cannot be checked."""
+    profile = (profiles if profiles is not None else orca_pipeline.load_agent_profiles()).get(agent)
+    if profile is None or not (profile.get("skill_dirs") or profile.get("plugin_skills")):
+        return None  # nothing to check against
+    if profile.get("plugin_skills") and ":" in name:
         return plugin_skill_exists(name)
     bare = name.split(":")[-1]  # other agents see plugin skills only as plain folders
-    return any(os.path.isfile(f"{d}/{bare}/SKILL.md") for d in skill_dirs(agent, project))
+    return any(os.path.isfile(f"{d}/{bare}/SKILL.md") for d in skill_dirs(profile, project))
 
 
 def git(project, *args):
@@ -120,25 +118,42 @@ def validate(path, network=True):
     if project and not git(project, "rev-parse", "--git-dir").returncode == 0:
         errors.append(f"path is not a git checkout: {cfg.get('path')}")
 
-    agents = {"plan": "claude", "implement": "opencode", "review": "codex", "e2e": "codex",
-              "ship": "codex", **cfg.get("agents", {})}
-    for stage, agent in agents.items():
-        if agent not in KNOWN_AGENTS:
-            errors.append(f"agents.{stage}: unknown agent '{agent}'")
+    profiles = orca_pipeline.load_agent_profiles(cfg)
+    agents = orca_pipeline.stage_agents(cfg)
+    stage_list = {s: (a if isinstance(a, list) else [a]) for s, a in agents.items()}
+    for stage in orca_pipeline.SINGLE_AGENT_STAGES:
+        if not isinstance(agents[stage], str):
+            errors.append(f"agents.{stage}: must name one agent (only agents.review takes a list)")
+    unchecked = set()
+    for name in sorted({a for names in stage_list.values() for a in names if isinstance(a, str)}):
+        profile = profiles.get(name)
+        if profile is None:
+            unchecked.add(name)
+            warnings.append(f"agent '{name}' has no profile: it starts with --agent {name} and its "
+                            f"skills are not checked. Add it to agents.local.json or agent_profiles.")
+        else:
+            if profile.get("cli") and not shutil.which(profile["cli"]):
+                warnings.append(f"agent '{name}': its CLI '{profile['cli']}' is not installed here")
+            if not (profile.get("skill_dirs") or profile.get("plugin_skills")):
+                unchecked.add(name)
+                warnings.append(f"agent '{name}' has no skill_dirs in its profile: its skills are "
+                                f"not checked")
+
+    def check(where, stage, skills):
+        for agent in stage_list.get(stage, []):
+            if agent in unchecked or not isinstance(agent, str):
+                continue
+            for skill in skills:
+                if not skill_visible(agent, skill, project, profiles):
+                    errors.append(f"{where}: '{skill}' not visible to {agent}")
 
     for mode, stages in (cfg.get("modes") or {}).items():
         for stage in STAGES:
             if not stages.get(stage):
                 errors.append(f"modes.{mode}.{stage}: empty")
-            for skill in stages.get(stage) or []:
-                if not skill_visible(agents.get(stage), skill, project):
-                    errors.append(f"modes.{mode}.{stage}: '{skill}' not visible to "
-                                  f"{agents.get(stage)}")
-    for stage, skills in (("e2e", cfg.get("e2e", {}).get("skills", [])),
-                          ("ship", cfg.get("ship", {}).get("skills", []))):
-        for skill in skills:
-            if not skill_visible(agents.get(stage), skill, project):
-                errors.append(f"{stage}.skills: '{skill}' not visible to {agents.get(stage)}")
+            check(f"modes.{mode}.{stage}", stage, stages.get(stage) or [])
+    check("e2e.skills", "e2e", cfg.get("e2e", {}).get("skills", []))
+    check("ship.skills", "ship", cfg.get("ship", {}).get("skills", []))
 
     if not cfg.get("test_commands"):
         warnings.append("no test_commands: every stage uses test_command")

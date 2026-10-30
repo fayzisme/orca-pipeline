@@ -8,12 +8,18 @@ This is an independent community project built on Orca's public CLI. It isn't
 affiliated with or endorsed by the Orca team. For Orca itself, see the
 [official documentation](https://www.onorca.dev/docs).
 
+By default:
+
 - **Claude Code** plans and designs the change.
 - **OpenCode** implements the plan.
 - **Codex** reviews the change, runs the tests, and optionally runs end-to-end
   checks.
 - When the review passes, Codex can commit, push, and open a pull request, but
   only after you approve it.
+
+These are only defaults. Any agent that Orca can launch can take any stage, you
+can add your own agents and model aliases, and several agents can review in
+parallel. See [Agents](#agents).
 
 Each agent loads the skills that fit the task (for example a debugging skill for
 a bug fix, or a security review skill for login code), and each project gets its
@@ -28,6 +34,7 @@ own configuration for test commands, rules, and URLs.
 - [Commands](#commands)
 - [The pipeline in detail](#the-pipeline-in-detail)
 - [Project configuration](#project-configuration)
+- [Agents](#agents)
 - [Onboarding a project with orca-init](#onboarding-a-project-with-orca-init)
 - [Why this works with Orca](#why-this-works-with-orca)
 - [Safety and control](#safety-and-control)
@@ -161,6 +168,7 @@ orca-dev <project> <type> <slug> "<task>" [--mode <mode>] [--no-branch] [pipelin
 orca-dev <project> --help      modes and skills of that project
 orca-dev --help                full help
 orca-dev --list                projects that have a configuration
+orca-dev --agents [project]    agent profiles, and which stages use them
 ```
 
 | Argument | Meaning |
@@ -307,7 +315,8 @@ is a full example for a Laravel application that runs in Docker.
 | `test_commands.implement`, `test_commands.review` | Test commands per stage. Typically only the named tests while implementing, and the full suite once in review. |
 | `known_failures` | Tests that already fail on the base branch, or `"none"`. |
 | `plan_dir`, `review_dir` | Where plans and review reports go. Defaults: `docs/plans`, `docs/reviews`. |
-| `agents` | The agent for each stage: `plan`, `implement`, `review`, `e2e`, `ship`. |
+| `agents` | The agent for each stage: `plan`, `implement`, `review`, `e2e`, `ship`. `review` may be a list of agents that review in parallel. See [Agents](#agents). |
+| `agent_profiles` | Optional. Agent profiles for this project only, added to `agents.json` and `agents.local.json`. |
 | `modes` | Named skill sets, each with a `plan`, `implement`, and `review` list. |
 | `gates.after_plan`, `gates.after_failure`, `gates.before_fix` | Which approval points are on. |
 | `answer_questions` | `"ask_me"` to answer worker questions yourself, or `"auto"`. |
@@ -321,7 +330,9 @@ is a full example for a Laravel application that runs in Docker.
 
 ### How agents are told to use skills
 
-The coordinator adds one sentence per stage, phrased the way each agent expects:
+The coordinator adds one sentence per stage, phrased the way each agent expects.
+The sentence comes from the agent's profile (see [Agents](#agents)). The
+defaults in `agents.json` are:
 
 | Agent | Sentence |
 | --- | --- |
@@ -329,14 +340,117 @@ The coordinator adds one sentence per stage, phrased the way each agent expects:
 | OpenCode | "Load each of these skills with your skill tool before you start: ..." |
 | Codex | "Use these skills: $skill-a, $skill-b." |
 
-A skill only works if that agent can find it. `validate_config.py` checks these
-folders:
+A skill only works if that agent can find it. `validate_config.py` checks the
+folders in each agent's profile. The defaults are:
 
 | Agent | Skill folders |
 | --- | --- |
 | Claude Code | `~/.claude/skills`, the project's `.claude/skills`, and installed plugins (`<plugin>:<skill>`) |
 | OpenCode | `~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills`, and the project's `.opencode/skills`, `.claude/skills`, and `.agents/skills` |
 | Codex | `~/.agents/skills`, `~/.codex/skills`, and the project's `.agents/skills` |
+
+## Agents
+
+Claude Code, OpenCode, and Codex are only the defaults. Any agent that Orca can
+launch can take any stage, and the review stage can run several agents in
+parallel. Orca's
+[`worker-start`](https://www.onorca.dev/docs/cli/orchestration) accepts agent ids
+such as `claude`, `codex`, `cursor`, `antigravity`, `muse`, `zcode`, `opencode`,
+and `opencode2`, depending on what's enabled in your Orca.
+
+### Agent profiles
+
+A profile tells the coordinator how to start an agent and how that agent finds
+skills. Profiles come from three places, and later ones override earlier ones
+key by key:
+
+1. `agents.json` in the repository: `claude`, `opencode`, and `codex`, with
+   verified skill folders.
+2. `agents.local.json` next to it: your own agents, for all projects. Keep it
+   out of Git.
+3. `agent_profiles` in a project configuration: agents for that project only.
+
+| Field | Meaning |
+| --- | --- |
+| `orca_id` | The id passed to `orca orchestration worker-start --agent`. Default: the profile name. |
+| `model`, `effort` | Optional `--model` and `--effort` for that launch. |
+| `extends` | Another profile to start from. The new profile inherits every field it doesn't set. |
+| `cli` | The command that must be installed. `validate_config.py` warns when it's missing. |
+| `skill_phrase` | The sentence that asks the agent to load skills. Use `{skills}` or `{dollar_skills}` (`$a, $b`). |
+| `skill_dirs` | Folders that hold `<skill>/SKILL.md`. `~` and `{project}` are expanded. |
+| `plugin_skills` | `true` when `<plugin>:<skill>` names resolve to installed Claude Code plugins. |
+| `description` | A short label for `orca-dev --agents`. |
+
+### Add an agent
+
+Create `agents.local.json` and describe the agent. This example adds Cursor's
+CLI. Check the skill folders and phrasing against that agent's own
+documentation, because they differ per tool:
+
+```json
+{
+  "agents": {
+    "cursor": {
+      "description": "Cursor CLI",
+      "orca_id": "cursor",
+      "cli": "cursor-agent",
+      "skill_phrase": "Use these skills before you start: {skills}.",
+      "skill_dirs": ["~/.cursor/skills", "{project}/.cursor/skills"]
+    }
+  }
+}
+```
+
+Then use it in a project configuration, for any stage:
+
+```json
+"agents": {"plan": "claude", "implement": "cursor", "review": "codex"}
+```
+
+An agent without a profile still runs: the coordinator starts it with
+`--agent <name>` and a generic skill sentence, and `validate_config.py` warns
+that its skills can't be checked.
+
+### Use another model for one stage
+
+An alias profile extends an existing one and changes only what you set. For
+example, plan with a larger model and keep the default model elsewhere:
+
+```json
+"agent_profiles": {
+  "claude-large": {"extends": "claude", "model": "<model id>"}
+},
+"agents": {"plan": "claude-large", "implement": "opencode", "review": "codex"}
+```
+
+The alias launches `--agent claude --model <model id>` and inherits Claude
+Code's skill sentence and skill folders.
+
+### Several reviewers
+
+Give `agents.review` a list:
+
+```json
+"agents": {"review": ["codex", "cursor"]}
+```
+
+- Each reviewer runs in parallel and writes its own report,
+  `docs/reviews/<slug>-<agent>.md`.
+- The review passes only when every reviewer reports PASS (and the end-to-end
+  worker, when it runs).
+- A fix round receives only the reports that failed. Then every reviewer
+  reviews again.
+- With one reviewer, the report keeps its usual name, `docs/reviews/<slug>.md`.
+
+Only `review` takes a list. `plan`, `implement`, `e2e`, and `ship` take one agent
+each, because implement and fix workers must never write at the same time.
+
+### Check your agents
+
+```bash
+orca-dev --agents            # every profile: launch flags, CLI installed, skill folders
+orca-dev --agents my-app     # also which stages use each agent in that project
+```
 
 ## Onboarding a project with orca-init
 
@@ -461,6 +575,8 @@ separate Git worktree.
 | `orca_init.py` | Onboarding: fact collection, the headless Claude run, and validation. |
 | `init-prompt.md` | Instructions Claude follows when it writes a configuration. |
 | `validate_config.py` | Configuration checks, also used by `orca_init.py`. |
+| `agents.json` | Default agent profiles: Claude Code, OpenCode, and Codex. |
+| `agents.local.json` | Optional and local. Your own agent profiles. Keep it out of Git. |
 | `examples/laravel-docker.example.json` | A full example configuration (Laravel in Docker). |
 | `local-reference.json` | Optional and local. Your own reference configuration for `orca-init`. Keep it out of Git. |
 | `projects/` | Your project configurations and onboarding reports. Keep it out of Git. |
@@ -470,6 +586,7 @@ A suggested `.gitignore`:
 ```gitignore
 projects/
 local-reference.json
+agents.local.json
 __pycache__/
 *.log
 ```
@@ -496,6 +613,8 @@ The pipeline writes these files inside each project:
 
 ## Limitations
 
+- Only the `claude`, `opencode`, and `codex` profiles are verified. For any
+  other agent, you set the skill folders and skill sentence in its profile.
 - The coordinator trusts each worker's reported outcome. A PASS means the
   reviewer reported PASS, not that you have verified it.
 - Running the review and end-to-end workers in parallel has only been tested

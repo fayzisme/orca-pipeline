@@ -2,6 +2,7 @@
 # and project details.
 projects/
 local-reference.json
+agents.local.json
 
 # Python and logs
 __pycache__/

@@ -1,0 +1,35 @@
+{
+  "agents": {
+    "claude": {
+      "description": "Claude Code",
+      "orca_id": "claude",
+      "cli": "claude",
+      "skill_phrase": "Invoke the Skill tool for each of these skills, in order, before you start: {skills}.",
+      "skill_dirs": ["~/.claude/skills", "{project}/.claude/skills"],
+      "plugin_skills": true
+    },
+    "opencode": {
+      "description": "OpenCode",
+      "orca_id": "opencode",
+      "cli": "opencode",
+      "skill_phrase": "Load each of these skills with your skill tool before you start: {skills}.",
+      "skill_dirs": [
+        "~/.config/opencode/skills",
+        "~/.claude/skills",
+        "~/.agents/skills",
+        "{project}/.opencode/skills",
+        "{project}/.claude/skills",
+        "{project}/.agents/skills"
+      ],
+      "plugin_skills": false
+    },
+    "codex": {
+      "description": "Codex CLI",
+      "orca_id": "codex",
+      "cli": "codex",
+      "skill_phrase": "Use these skills: {dollar_skills}.",
+      "skill_dirs": ["~/.agents/skills", "~/.codex/skills", "{project}/.agents/skills"],
+      "plugin_skills": false
+    }
+  }
+}

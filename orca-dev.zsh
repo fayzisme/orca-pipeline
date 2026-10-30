@@ -86,9 +86,11 @@ _orca_dev_branch() {
 
 # Prints help: general when $1 is empty, else the modes of that project's config.
 _orca_dev_help() {
-  python3 - "$ORCA_PIPELINE_DIR/projects" "$1" <<'EOF'
+  python3 - "$ORCA_PIPELINE_DIR/projects" "$1" "$ORCA_PIPELINE_DIR" <<'EOF'
 import json, os, sys
 projects, project = sys.argv[1], sys.argv[2]
+sys.path.insert(0, sys.argv[3])
+from orca_pipeline import stage_agents
 names = sorted(f[:-5] for f in os.listdir(projects) if f.endswith(".json")) \
     if os.path.isdir(projects) else []
 USE = {
@@ -107,6 +109,7 @@ Usage
   orca-dev <project> <type> <slug> "<task>" [--mode <mode>] [--no-branch] [pipeline flags]
   orca-dev <project> --help      modes and skills of that project
   orca-dev --list                projects that have a config
+  orca-dev --agents [project]    agent profiles: Orca id, model, CLI, skill folders
   orca-init <path>               create the config for a new project
 
 Arguments
@@ -150,7 +153,9 @@ if not os.path.exists(path):
     sys.exit(f"No config for '{project}'. Projects: {', '.join(names) or 'none'}. "
              f"Create one with: orca-init <path>")
 cfg = json.load(open(path))
-agents = {"plan": "claude", "implement": "opencode", "review": "codex", **cfg.get("agents", {})}
+agents = stage_agents(cfg)
+show = {s: (", ".join(a) if isinstance(a, list) else a) for s, a in agents.items()}
+print("Agents: " + " | ".join(f"{s} {a}" for s, a in show.items()) + "   (orca-dev --agents for profiles)")
 print(f"Modes for {project} ({cfg.get('path', '?')}). Default: fix/hotfix -> bugfix, "
       f"feature/improve -> small.\n")
 seen = {}
@@ -164,7 +169,7 @@ for mode, stages in cfg.get("modes", {}).items():
     print(f"--mode {mode}{note}")
     print(f"  use for: {USE.get(mode, 'custom mode from this config')}")
     for stage in ("plan", "implement", "review"):
-        print(f"  {stage:9} ({agents[stage]}): {', '.join(stages.get(stage, [])) or '-'}")
+        print(f"  {stage:9} ({show[stage]}): {', '.join(stages.get(stage, [])) or '-'}")
     print()
 e2e = cfg.get("e2e", {})
 if e2e.get("modules"):
@@ -174,16 +179,62 @@ print(f"Ship: {'on' if ship.get('enabled') else 'off'}, skills {', '.join(ship.g
 EOF
 }
 
+# Lists agent profiles (agents.json, agents.local.json, and the project's agent_profiles).
+_orca_dev_agents() {
+  python3 - "$ORCA_PIPELINE_DIR" "$1" <<'EOF'
+import json, os, shutil, sys
+sys.path.insert(0, sys.argv[1])
+from orca_pipeline import load_agent_profiles, stage_agents
+cfg = {}
+if sys.argv[2]:
+    path = os.path.join(sys.argv[1], "projects", sys.argv[2] + ".json")
+    if not os.path.exists(path):
+        sys.exit(f"No config for '{sys.argv[2]}'")
+    cfg = json.load(open(path))
+profiles = load_agent_profiles(cfg)
+used = {}
+if cfg:
+    for stage, names in stage_agents(cfg).items():
+        for n in (names if isinstance(names, list) else [names]):
+            used.setdefault(n, []).append(stage)
+project_dir = os.path.expanduser(cfg.get("path", "."))
+print("Agent profiles" + (f" for {sys.argv[2]}" if cfg else "") + ":\n")
+for name in sorted(set(profiles) | set(used)):
+    p = profiles.get(name)
+    if p is None:
+        print(f"{name}  (no profile: starts with --agent {name}; skills not checked)")
+    else:
+        flags = "".join(f" --{k} {p[k]}" for k in ("model", "effort") if p.get(k))
+        cli = p.get("cli")
+        cli_state = "-" if not cli else cli + (" (installed)" if shutil.which(cli)
+                                               else " (NOT installed)")
+        dirs = [os.path.expanduser(d.replace("{project}", project_dir))
+                for d in p.get("skill_dirs", [])]
+        print(f"{name}  {p.get('description', '')}")
+        print(f"  launch: --agent {p.get('orca_id', name)}{flags}   cli: {cli_state}")
+        print(f"  skill folders: {sum(os.path.isdir(d) for d in dirs)} of {len(dirs)} exist"
+              + ("; plugin skills" if p.get("plugin_skills") else ""))
+    if name in used:
+        print(f"  used for: {', '.join(used[name])}")
+    print()
+print("Add or change agents in agents.local.json (all projects) or agent_profiles in a "
+      "project config.")
+EOF
+}
+
 orca-dev() {
   emulate -L zsh
   local usage='usage: orca-dev <project> <feature|fix|improve|hotfix> <slug> "<task>" [--mode <mode>] [--no-branch] [pipeline flags...]
-       orca-dev --help | orca-dev <project> --help | orca-dev --list'
+       orca-dev --help | orca-dev <project> --help | orca-dev --list | orca-dev --agents [project]'
   local projects=$ORCA_PIPELINE_DIR/projects
   if [[ $1 == (--help|-h|help) ]]; then
     _orca_dev_help ""; return
   fi
   if [[ $2 == (--help|-h|help) ]]; then
     _orca_dev_help $1; return
+  fi
+  if [[ $1 == --agents ]]; then
+    _orca_dev_agents ${2:-}; return
   fi
   if [[ $1 == --list ]]; then
     local f

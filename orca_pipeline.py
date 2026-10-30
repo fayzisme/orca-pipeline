@@ -39,11 +39,60 @@ EVIDENCE_RULE = (
     "run the new test once before the fix and quote that failing summary. Keep the report under "
     "3000 characters.")
 
-DEFAULT_SKILL_PHRASES = {
-    "claude": "Invoke the Skill tool for each of these skills, in order, before you start: {skills}.",
-    "opencode": "Load each of these skills with your skill tool before you start: {skills}.",
-    "codex": "Use these skills: {dollar_skills}.",
-}
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Which agent runs each stage when the config does not say. "review" may also be a list of
+# agents, which then review in parallel; every other stage takes exactly one agent.
+DEFAULT_AGENTS = {"plan": "claude", "implement": "opencode", "review": "codex",
+                  "e2e": "codex", "ship": "codex"}
+SINGLE_AGENT_STAGES = ("plan", "implement", "e2e", "ship")
+
+# For an agent without a profile, or a profile without a skill_phrase.
+GENERIC_SKILL_PHRASE = ("Use these skills before you start, if your tool supports skills: "
+                        "{skills}.")
+
+
+def load_agent_profiles(cfg=None):
+    """Agent profiles: agents.json, then agents.local.json, then the config's agent_profiles.
+
+    A profile describes how to start an agent and how it finds skills:
+      orca_id        id for `orca orchestration worker-start --agent` (default: profile name)
+      model, effort  optional --model / --effort for that launch
+      cli            command that must be installed (checked by validate_config.py)
+      skill_phrase   sentence that asks the agent to load skills ({skills}, {dollar_skills})
+      skill_dirs     folders holding <skill>/SKILL.md; "~" and "{project}" are expanded
+      plugin_skills  true when "<plugin>:<skill>" names resolve to installed plugins
+      extends        another profile to start from, e.g. an alias "claude-opus" that
+                     extends "claude" and only sets "model"
+    Later sources override earlier ones key by key.
+    """
+    raw = {}
+    for path in (os.path.join(HERE, "agents.json"), os.path.join(HERE, "agents.local.json")):
+        if os.path.exists(path):
+            with open(path) as f:
+                for name, profile in json.load(f).get("agents", {}).items():
+                    raw[name] = {**raw.get(name, {}), **profile}
+    for name, profile in ((cfg or {}).get("agent_profiles") or {}).items():
+        raw[name] = {**raw.get(name, {}), **profile}
+
+    def resolve(name, seen=()):
+        profile = raw[name]
+        parent = profile.get("extends")
+        if not parent or parent not in raw or parent in seen:
+            return dict(profile)
+        merged = {**resolve(parent, seen + (name,)), **profile}
+        merged.setdefault("orca_id", parent)  # an alias launches its parent's agent
+        return merged
+
+    return {name: resolve(name) for name in raw}
+
+
+def stage_agents(cfg):
+    """{stage: agent} from the config over DEFAULT_AGENTS; "review" is always a list."""
+    agents = {**DEFAULT_AGENTS, **cfg.get("agents", {})}
+    reviewers = agents["review"] if isinstance(agents["review"], list) else [agents["review"]]
+    agents["review"] = list(dict.fromkeys(reviewers))  # keep order, drop repeats
+    return agents
 
 
 def log(msg):
@@ -125,8 +174,9 @@ def parse_payload(message):
 def skill_line(cfg, agent, skills):
     if not skills:
         return ""
-    phrases = {**DEFAULT_SKILL_PHRASES, **cfg.get("skill_phrases", {})}
-    template = phrases.get(agent, DEFAULT_SKILL_PHRASES["opencode"])
+    template = (cfg.get("skill_phrases", {}).get(agent)
+                or load_agent_profiles(cfg).get(agent, {}).get("skill_phrase")
+                or GENERIC_SKILL_PHRASE)
     return template.format(skills=", ".join(skills),
                            dollar_skills=", ".join(f"${s}" for s in skills))
 
@@ -237,8 +287,16 @@ class Pipeline:
         self.review = f"{cfg.get('review_dir', 'docs/reviews')}/{self.slug}.md"
         self.e2e_report = f"{cfg.get('review_dir', 'docs/reviews')}/{self.slug}-e2e.md"
         self.mode = cfg["modes"][args.mode]
-        self.agents = {"plan": "claude", "implement": "opencode", "review": "codex",
-                       "e2e": "codex", "ship": "codex", **cfg.get("agents", {})}
+        self.agents = stage_agents(cfg)
+        for stage in SINGLE_AGENT_STAGES:
+            if not isinstance(self.agents[stage], str):
+                sys.exit(f"agents.{stage} must name one agent; only agents.review takes a list")
+        self.profiles = load_agent_profiles(cfg)
+        reviewers = self.agents["review"]
+        review_dir = cfg.get("review_dir", "docs/reviews")
+        # One reviewer keeps <slug>.md; several each get <slug>-<agent>.md.
+        self.reviews = {a: self.review if len(reviewers) == 1 else f"{review_dir}/{self.slug}-{a}.md"
+                        for a in reviewers}
         self.timeout = cfg.get("stage_timeout_min", 45) * 60
         self.baseline_path = f".orca-pipeline/{self.slug}.baseline.json"
         self.reports = {}  # dispatch -> body of its worker_done message
@@ -252,16 +310,23 @@ class Pipeline:
         self.common = f"Do not commit, push, or switch branches. {self.base_rules}"
 
     # ---- orca plumbing -------------------------------------------------
-    def start(self, stage, title, spec):
-        agent = self.agents[stage]
+    def start(self, stage, title, spec, agent=None):
+        """Start one worker. `agent` names a profile; it defaults to the stage's agent."""
+        agent = agent or self.agents[stage]
+        profile = self.profiles.get(agent, {})
+        orca_id = profile.get("orca_id", agent)
+        launch = ["--agent", orca_id]
+        for flag in ("model", "effort"):
+            if profile.get(flag):
+                launch += [f"--{flag}", str(profile[flag])]
+        label = agent if orca_id == agent else f"{agent} = {' '.join(launch[1:])}"
         if DRY_RUN:
-            print(f"\n===== {title} ({agent}) =====\n{spec}\n")
+            print(f"\n===== {title} ({label}) =====\n{spec}\n")
             return f"dry-{title}"
         data = orca("orchestration", "worker-start", "--spec", spec, "--task-title", title,
-                    "--worktree", "current", "--agent", agent, "--run", self.run_id,
-                    "--from", self.me)
+                    "--worktree", "current", *launch, "--run", self.run_id, "--from", self.me)
         dispatch = find_key(data.get("result") or {}, "dispatchId")
-        log(f"started {agent} for '{title}': dispatch={dispatch}")
+        log(f"started {label} for '{title}': dispatch={dispatch}")
         return dispatch
 
     def answer_question(self, message):
@@ -432,22 +497,29 @@ class Pipeline:
             f"{EVIDENCE_RULE}\n"
             f"Observable acceptance: the plan's tests pass and every acceptance criterion is met.")
 
-    def review_spec(self):
+    def review_spec(self, agent=None):
+        agent = agent or self.agents["review"][0]
+        report = self.reviews[agent]
+        others = [a for a in self.agents["review"] if a != agent]
+        parallel = (f"Other reviewers ({', '.join(others)}) review the same change at the same "
+                    f"time and write their own reports; judge independently and do not read or "
+                    f"edit their reports.\n" if others else "")
         return (
             f"Target: the uncommitted changes in this repository (git diff and untracked files) "
             f"against {self.plan}.\n"
-            f"{skill_line(self.cfg, self.agents['review'], self.mode.get('review', []))}\n"
+            f"{skill_line(self.cfg, agent, self.mode.get('review', []))}\n"
             f"Run tests with: {self.test_command('review')}\n"
-            f"Write {self.review}, replacing any earlier report: verdict PASS/FAIL, test summary, "
+            f"Write {report}, replacing any earlier report: verdict PASS/FAIL, test summary, "
             f"blocking issues with file:line and a concrete fix, non-blocking follow-ups.\n"
+            f"{parallel}"
             f"Review scope: judge only lines added or changed in the diff. Pre-existing problems are "
             f"non-blocking follow-ups. Blocking issues are limited to functional bugs, failing tests "
             f"outside the known failures, unmet acceptance criteria, and problems introduced by "
             f"changed lines.\n"
-            f"Constraints: do NOT edit any file except {self.review}. {self.rules('review')} "
+            f"Constraints: do NOT edit any file except {report}. {self.rules('review')} "
             f"{self.common}\n"
             f"{self.implementer_evidence()}"
-            f"Observable acceptance: {self.review} exists. Report --outcome succeeded only when the "
+            f"Observable acceptance: {report} exists. Report --outcome succeeded only when the "
             f"verdict is PASS.")
 
     def implementer_evidence(self):
@@ -564,17 +636,26 @@ class Pipeline:
     def stage_review(self):
         e2e_on = self.args.e2e or self.cfg.get("e2e", {}).get("enabled", False)
         max_rounds = self.cfg.get("max_fix_rounds", 2)
+        reviewers = self.agents["review"]
+        reports = ", ".join(self.reviews.values())
         for round_no in range(max_rounds + 1):
-            self.board("in_review", f"review round {round_no + 1}" + (" + e2e" if e2e_on else ""))
-            dispatches = {self.start("review", f"review-{round_no}", self.review_spec()): self.review}
+            self.board("in_review", f"review round {round_no + 1}"
+                       + (f" ({len(reviewers)} reviewers)" if len(reviewers) > 1 else "")
+                       + (" + e2e" if e2e_on else ""))
+            # Every reviewer, and the E2E worker, runs in parallel; all must pass.
+            dispatches = {}
+            for agent in reviewers:
+                title = f"review-{round_no}" + (f"-{agent}" if len(reviewers) > 1 else "")
+                dispatches[self.start("review", title, self.review_spec(agent), agent)] = \
+                    self.reviews[agent]
             if e2e_on:
                 dispatches[self.start("e2e", f"e2e-{round_no}", self.e2e_spec())] = self.e2e_report
             results = self.wait_all(list(dispatches))
             failed = [dispatches[d] for d, o in results.items() if o != "succeeded"]
             if not failed:
-                self.board("done", f"review PASS: check git diff, then commit ({self.review})",
+                self.board("done", f"review PASS: check git diff, then commit ({reports})",
                            unread=True)
-                log(f"DONE: review PASS. Plan {self.plan}, review {self.review}. "
+                log(f"DONE: review PASS. Plan {self.plan}, review {reports}. "
                     f"Check git diff, run the tests yourself, then commit.")
                 return True
             log(f"review FAIL ({', '.join(failed)}), round {round_no + 1} of {max_rounds + 1}")
@@ -589,8 +670,8 @@ class Pipeline:
             d = self.start("implement", f"fix-{round_no + 1}", self.fix_spec(failed))
             self.wait_all([d])
             self.last_impl_report = self.reports.get(d, "") or self.last_impl_report
-        self.board(comment=f"STOP: review did not pass, read {self.review}", unread=True)
-        log(f"STOP: review did not pass. Read {self.review} and decide by hand.")
+        self.board(comment=f"STOP: review did not pass, read {reports}", unread=True)
+        log(f"STOP: review did not pass. Read {reports} and decide by hand.")
         return False
 
     def stage_ship(self):

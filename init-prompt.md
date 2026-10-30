@@ -62,7 +62,10 @@ unattended: nobody can answer questions, so record open questions in the report 
   values, test bootstrap). If they do, or if you cannot tell, copy the reference's rule that
   tests must not write to the database into `extra_rules.implement` and `extra_rules.review`.
 - `known_failures`: "none" unless the code clearly shows a broken test; never guess.
-- `agents`: keep claude / opencode / codex as in the reference.
+- `agents`: keep the stages' agents as in the reference. Only name agents listed under
+  `agents` in the facts, preferably ones with `cli_installed` true. `agents.review` may be
+  a list when the reference uses several reviewers; every other stage takes one agent. Copy
+  the reference's `agent_profiles` when it has them.
 - `modes`: keep the six modes (small, bugfix, ui, secure, large, scratch). Start from the
   reference skills, then drop or replace each skill that is not visible for that agent in
   the facts. Laravel skills only for Laravel projects; `bmad-*` skills only if the facts say
@@ -77,7 +80,7 @@ unattended: nobody can answer questions, so record open questions in the report 
   {}. `modules`: top-level route prefixes of the app's modules (for example from
   `modules/*/Http/routes.php`, `routes/web.php`, or the router file); confirm them by
   reading route files, not by guessing. `login_note`: how a test user logs in, using
-  environment variables. Keep `skills` as in the reference if visible to codex.
+  environment variables. Keep `skills` as in the reference if visible to the e2e agent.
 - `ship`: `skills` as in the reference when visible to the ship agent, `follow_review` false,
   `timeout_min` 30. `base_branch` is where task branches start and where PRs go:
   - first, the branch the project's docs or CLAUDE.md name for PRs (for example a branching
