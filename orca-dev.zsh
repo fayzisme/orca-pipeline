@@ -126,7 +126,7 @@ Use --mode when the task is one of these:""")
         if mode not in ("small", "bugfix"):
             print(f"  --mode {mode:8} {use}")
     print("""
-Options
+Options (after the task, on the same line; end a line with \\ to continue it)
   --mode <mode>          skill set for this run (see orca-dev <project> --help)
   --no-branch            stay on the current branch
   --dry-run              print every worker spec; start nothing, switch no branch
@@ -222,6 +222,57 @@ print("Add or change agents in agents.local.json (all projects) or agent_profile
 EOF
 }
 
+# Says which positional argument is missing or misplaced, with an example. Returns 0 when
+# <project> <type> <slug> "<task>" look right.
+_orca_dev_check_args() {
+  emulate -L zsh
+  local -a names=('<project>' '<type>' '<slug>' '"<task>"')
+  local project=${1:-my-app} i first
+  [[ $project == --* ]] && project=my-app
+  local example="  orca-dev $project fix short-name \"What is broken, in plain words\" --dry-run"
+  local tip="Options (--mode, --dry-run, ...) go after the task, on the same line."
+  # An option among the first four arguments means an argument before it is missing.
+  for i in {1..4}; do
+    if [[ ${@[i]} == --* ]]; then
+      print -u2 -- "orca-dev: missing ${(j:, :)names[i,4]} before ${@[i]}. $tip"
+      print -u2 -- "example:\n$example"
+      return 2
+    fi
+  done
+  if (( $# < 4 )); then
+    first=${${3%%$'\n'*}[1,50]}
+    if (( $# == 3 )) && [[ ! $3 =~ '^[a-z0-9][a-z0-9-]*$' ]]; then
+      print -u2 -- "orca-dev: missing <slug>. \"$first...\" looks like the task: put a short"
+      print -u2 -- "kebab-case <slug> (for example ppb-403) before it."
+    else
+      print -u2 -- "orca-dev: missing ${(j:, :)names[$#+1,4]}."
+    fi
+    print -u2 -- "usage: orca-dev <project> <feature|fix|improve|hotfix> <slug> \"<task>\" [options]"
+    print -u2 -- "example:\n$example"
+    print -u2 -- "If you saw 'command not found: --mode', the options were on a new line. $tip"
+    return 2
+  fi
+  if [[ $2 != (feature|fix|improve|hotfix) ]]; then
+    print -u2 -- "orca-dev: unknown <type> '$2'. Use feature, fix, improve, or hotfix."
+    [[ $2 == (small|bugfix|ui|secure|large|scratch) ]] && print -u2 -- \
+      "'$2' is a mode: pick a <type> here, and add --mode $2 after the task if you need it."
+    print -u2 -- "example:\n$example"
+    return 2
+  fi
+  if [[ ! $3 =~ '^[a-z0-9][a-z0-9-]*$' ]]; then
+    first=${${3%%$'\n'*}[1,50]}
+    if [[ $3 == *[[:space:]]* ]]; then
+      print -u2 -- "orca-dev: \"$first...\" looks like the task, not a <slug>. Put a short"
+      print -u2 -- "kebab-case <slug> (for example ppb-403) before the task."
+    else
+      print -u2 -- "orca-dev: <slug> '$3' must be kebab-case: lowercase letters, digits, hyphens."
+    fi
+    print -u2 -- "example:\n$example"
+    return 2
+  fi
+  return 0
+}
+
 orca-dev() {
   emulate -L zsh
   local usage='usage: orca-dev <project> <feature|fix|improve|hotfix> <slug> "<task>" [--mode <mode>] [--no-branch] [pipeline flags...]
@@ -241,20 +292,15 @@ orca-dev() {
     for f in $projects/*.json(N); do print -- ${f:t:r}; done
     return 0
   fi
-  if (( $# < 4 )); then
-    print -u2 -- $usage; return 2
+  if (( $# == 0 )); then
+    print -u2 -- $usage; print -u2 -- "orca-dev --help for details"; return 2
   fi
+  _orca_dev_check_args "$@" || return 2
   local project=$1 type=$2 slug=$3 task=$4; shift 4
   local config=$projects/$project.json
   if [[ ! -f $config ]]; then
     print -u2 -- "No config for '$project' ($config). Create it with: orca-init <path>"
     return 2
-  fi
-  if [[ $type != (feature|fix|improve|hotfix) ]]; then
-    print -u2 -- $usage; return 2
-  fi
-  if [[ ! $slug =~ '^[a-z0-9][a-z0-9-]*$' ]]; then
-    print -u2 -- "slug must be kebab-case: lowercase letters, digits, hyphens"; return 2
   fi
   local target dir base
   target=$(_orca_dev_target $config) || return 2
