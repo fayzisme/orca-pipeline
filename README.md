@@ -471,7 +471,9 @@ checkout, inside or outside `~/Sites`, with or without Docker.
 For each project, it does four things:
 
 1. Adds the folder to Orca (`orca repo add`), and adds `.orca-pipeline/` to the
-   project's `.git/info/exclude`.
+   project's `.git/info/exclude`. Orca must be running. If it isn't,
+   `orca-init` stops here, before it changes anything or runs Claude: open the
+   Orca app (or run `orca open`) and run the same command again.
 2. Collects facts it can check itself:
    - Branches on `origin`, and the remote host.
    - Stack versions from `composer.json` and `package.json`.
@@ -506,8 +508,21 @@ Options:
 | `--force` | The project's setup changed. The old configuration is kept as `<name>.json.bak` and restored if the run fails. |
 | `--name <name>` | Two folders share a name, for example `~/Sites/app/api` and `~/code/api`. |
 | `--all [--root <folder>]` | You want every Git repository directly under a folder. The default root is `~/Sites/app`. |
-| `--no-register` | You don't want the folder added to Orca. |
+| `--no-register` | You don't want the folder added to Orca, or Orca is closed and you only want the configuration. Add the folder later with `orca repo add --path <folder>`. |
 | `--model <id>` | You want a specific Claude model for onboarding. |
+
+While it runs, `orca-init` shows four steps, `[1/4]` to `[4/4]`. Step 3, the
+Claude run, is the slow one and often takes 2 to 10 minutes. During that step, a
+live line shows a spinner and the elapsed time:
+
+```text
+⠹ Claude is working 01:23  (not finished, Ctrl+C cancels)
+```
+
+The run is finished only when the `Done in ...` line appears. Without a terminal
+(a pipe or a log file), it prints a line every 30 seconds instead. With `--all`,
+each project header shows its position, such as `[2 of 9]`. Ctrl+C stops Claude
+and puts an existing configuration back.
 
 After a run:
 
@@ -615,6 +630,8 @@ The pipeline writes these files inside each project:
 | Symptom | What to do |
 | --- | --- |
 | `Run this inside an Orca terminal` | Start the pipeline with `orca-dev`, or from a terminal tab inside Orca. |
+| `Orca is not running` (from `orca-init` or `orca-dev`) | Open the Orca app, or run `orca open`, then run the same command again. Both commands check this first, so nothing was changed or run. A project that already has a configuration is only registered again, so no Claude run is repeated. |
+| `runtime_unavailable` or `Could not read Orca runtime metadata` | The same cause: the `orca` CLI can't find a running Orca. Open Orca and retry. |
 | `orca-dev: command not found` | Add the `source` line to `~/.zshrc`, then open a new terminal or run `source ~/.zshrc`. |
 | `Could not switch to <branch>` | Your local changes conflict with the new branch. Commit, stash, or move them, or use `--no-branch`. |
 | A worker waits for approval in its tab | Some agents ask before they run certain commands, such as Docker. Answer in that worker's tab. |

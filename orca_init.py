@@ -32,6 +32,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -59,6 +60,53 @@ def run(cmd, cwd=None, timeout=30):
         return p.returncode, p.stdout.strip()
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, f"{type(e).__name__}"
+
+
+HEARTBEAT_SECONDS = 30  # without a terminal, a line this often keeps a run from looking stuck
+
+
+def elapsed_text(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def wait_with_progress(proc, label):
+    """Wait for a process and show that it is still running. Returns its exit code.
+
+    In a terminal: one live line with a spinner and the elapsed time, replaced by a
+    "finished" line at the end. Without a terminal (a pipe or a log): one line every
+    HEARTBEAT_SECONDS. Ctrl+C stops the process and raises KeyboardInterrupt.
+    """
+    start = last_beat = time.time()
+    tty = sys.stdout.isatty()
+    utf8 = (sys.stdout.encoding or "").lower().startswith("utf")
+    frames = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f" if utf8 else "|/-\\"
+    width = shutil.get_terminal_size((100, 24)).columns
+    tick = 0
+    try:
+        while proc.poll() is None:
+            now = time.time()
+            stamp = elapsed_text(now - start)
+            if tty:
+                line = f"  {frames[tick % len(frames)]} {label} {stamp}  (not finished, Ctrl+C cancels)"
+                print("\r" + line[:width - 1] + "\033[K", end="", flush=True)
+            elif now - last_beat >= HEARTBEAT_SECONDS:
+                print(f"  ... {label}, still running ({stamp})", flush=True)
+                last_beat = now
+            tick += 1
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print(("\r\033[K" if tty else "") + f"  interrupted after {elapsed_text(time.time() - start)}; "
+              "the process was stopped.", flush=True)
+        raise
+    done = f"{label}: finished in {elapsed_text(time.time() - start)} (exit {proc.returncode})"
+    print(("\r\033[K" if tty else "") + "  " + done, flush=True)
+    return proc.returncode
 
 
 def tilde(path):
@@ -277,23 +325,63 @@ def collect_facts(path, name):
 
 
 # ---- steps ---------------------------------------------------------------
+ORCA_DOWN = ("Orca is not running, or its runtime can't be reached, so the folder can't be added "
+             "to it. Open the Orca app (or run: orca open), then run the same command again. "
+             "To onboard without Orca, pass --no-register and add the folder later with: "
+             "orca repo add --path <folder>")
+
+
+def orca_down_message(detail=""):
+    return ORCA_DOWN + (f" ({detail})" if detail else "")
+
+
+def orca_reachable():
+    """(True, "") unless Orca says it is down; then (False, why).
+
+    Fail-open: an answer we don't recognise counts as up, and the next orca command
+    reports its own error.
+    """
+    code, out = run([ORCA, "status", "--json"])
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return False, f"could not run '{ORCA} status': {out[:100] or 'no output'}"
+    result = data.get("result") or {}
+    app = result.get("app") or {}
+    runtime = result.get("runtime") or {}
+    if not data.get("ok") or app.get("running") is False or runtime.get("reachable") is False:
+        return False, ""
+    return True, ""
+
+
 def register(path, dry):
+    """Add the folder to Orca. Returns (ok, message); the caller decides what a failure means."""
+    up, detail = orca_reachable()
+    if not up:
+        if dry:
+            return True, "would register in Orca (Orca is not running right now; open it before a real run)"
+        return False, orca_down_message(detail)
     code, out = run([ORCA, "repo", "list", "--json"])
     try:
-        result = json.loads(out).get("result", {})
+        data = json.loads(out)
+        if not data.get("ok"):
+            return False, f"could not list Orca projects: {json.dumps(data.get('error'))[:200]}"
+        result = data.get("result", {})
         repos = result.get("repos", result) if isinstance(result, dict) else result
         if any(os.path.realpath(r.get("path", "")) == os.path.realpath(path) for r in repos):
-            return "already registered in Orca"
+            return True, "already registered in Orca"
     except (ValueError, AttributeError):
-        return f"could not list Orca repos (is Orca running?): {out[:200]}"
+        return False, f"could not read the Orca project list: {out[:200]}"
     if dry:
-        return "would register in Orca"
+        return True, "would register in Orca"
     code, out = run([ORCA, "repo", "add", "--path", path, "--json"])
     try:
-        ok = json.loads(out).get("ok")
+        data = json.loads(out)
     except ValueError:
-        ok = False
-    return "registered in Orca" if ok else f"Orca registration failed: {out[:200]}"
+        data = {}
+    if data.get("ok"):
+        return True, "registered in Orca"
+    return False, f"Orca registration failed: {json.dumps(data.get('error') or out)[:200]}"
 
 
 def exclude_pipeline_dir(path, dry):
@@ -348,10 +436,10 @@ def configured_path(config):
         return None
 
 
-def onboard(path, args):
+def onboard(path, args, index=1, total=1):
     path = os.path.realpath(os.path.expanduser(path))
     name = slug(args.name or os.path.basename(path))
-    print(f"\n=== {name} ({tilde(path)})")
+    print(f"\n=== {name} ({tilde(path)})" + (f"  [{index} of {total}]" if total > 1 else ""))
     if run(["git", "-C", path, "rev-parse", "--git-dir"])[0] != 0:
         print("  SKIP: not a git repository")
         return False
@@ -364,10 +452,21 @@ def onboard(path, args):
             return False
         if not args.force:
             print(f"  SKIP: {tilde(config)} exists (use --force to redo it)")
-            return True
+            if args.no_register:
+                return True
+            # Cheap and safe to repeat: finishes a registration that failed the first time.
+            ok, message = register(path, args.dry_run)
+            print("  " + message)
+            return ok
     if not args.no_register:
-        print("  " + register(path, args.dry_run))
+        ok, message = register(path, args.dry_run)
+        print("  [1/4] " + message)
+        if not ok:
+            # Stop before the Claude run: nothing was changed, and no time or budget was spent.
+            print("  FAIL: stopped before changing anything or running Claude.")
+            return False
     print("  " + exclude_pipeline_dir(path, args.dry_run))
+    print("  [2/4] collecting facts: git, stack, runtime, skills ...", flush=True)
     facts = collect_facts(path, name)
     cmd, config, report = claude_command(path, name, facts, args)
     if args.dry_run:
@@ -384,10 +483,18 @@ def onboard(path, args):
     if os.path.exists(report):
         os.remove(report)  # a report from an earlier run would describe the old config
     log_path = os.path.join(PROJECTS, f"{name}.init.log")
-    print(f"  running Claude headless (log: {tilde(log_path)}) ...", flush=True)
-    with open(log_path, "w") as log:
-        proc = subprocess.run(cmd, cwd=path, stdout=log, stderr=subprocess.STDOUT,
-                              env={**os.environ, "ORCA_INIT_CONFIG_OUT": config})
+    print(f"  [3/4] Claude reads the project and writes the config; this often takes 2 to 10 "
+          f"minutes. Log: {tilde(log_path)}", flush=True)
+    try:
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(cmd, cwd=path, stdout=log, stderr=subprocess.STDOUT,
+                                    env={**os.environ, "ORCA_INIT_CONFIG_OUT": config})
+            wait_with_progress(proc, "Claude is working")
+    except KeyboardInterrupt:
+        if not os.path.exists(config) and os.path.exists(backup):
+            os.replace(backup, config)
+            print("  the previous config was restored.", flush=True)
+        raise
     if not os.path.exists(config):
         restored = ""
         if os.path.exists(backup):
@@ -397,6 +504,7 @@ def onboard(path, args):
               + restored)
         return False
 
+    print("  [4/4] validating the configuration ...", flush=True)
     errors, warnings = validate_config.validate(config)
     for w in warnings:
         print(f"  WARN  {w}")
@@ -432,12 +540,16 @@ Options
   --force            redo a project that already has a config. The old config is kept as
                      <name>.json.bak and put back if the new run fails.
   --name <name>      needed when two folders share a name (~/Sites/app/api and ~/code/api)
-  --no-register      do not add the folder to Orca's project list
+  --no-register      do not add the folder to Orca's project list. Use it when Orca is closed
+                     and you only want the configuration.
   --budget-usd <n>   cost cap per Claude run, in dollars (default 5; 0 = no cap)
   --model <id>       Claude model for the onboarding run (default: your Claude setting)
 
 What happens per project
-  1. Registers the folder in Orca, and adds .orca-pipeline/ to .git/info/exclude.
+  1. Registers the folder in Orca, and adds .orca-pipeline/ to .git/info/exclude. If Orca
+     is not running, orca-init stops here without running Claude: open Orca (or run
+     `orca open`) and run the same command again. A project that already has a
+     configuration is only registered, so nothing is redone.
   2. Collects facts it can check itself: branches on origin, stack versions, the runtime
      (a Docker container that mounts the folder, or this Mac's PHP/Node/Python), the test
      runner, the <name>.local host or dev-server URL, the vault page, and which skills
@@ -445,6 +557,11 @@ What happens per project
   3. Runs Claude (claude -p) in the folder. Claude may only read the project and write two
      files; it cannot edit the project, read .env files or keys, run docker, or browse.
   4. Checks the config with validate_config.py and a pipeline dry run, then prints PASS/FAIL.
+
+While it works, orca-init shows steps [1/4] to [4/4]. During step 3 (the slow one) a live
+line with a spinner and the elapsed time stays on screen; without a terminal, a line is
+printed every 30 seconds. The run is finished only when the 'Done in ...' line appears.
+Ctrl+C stops it, and an existing configuration is put back.
 
 Files it writes (in ~/orca-pipeline/projects/)
   <name>.json              the config orca-dev reads
@@ -502,11 +619,22 @@ def main():
         ap.error("--name works with exactly one project path")
     if not args.dry_run and not shutil.which("claude"):
         sys.exit("claude CLI not found in PATH")
-    results = {p: onboard(p, args) for p in paths}
+    if not args.dry_run and not args.no_register:
+        up, detail = orca_reachable()
+        if not up:  # say so once, before any project is touched
+            sys.exit(orca_down_message(detail))
+    started = time.time()
+    results = {}
+    try:
+        for number, p in enumerate(paths, 1):
+            results[p] = onboard(p, args, number, len(paths))
+    except KeyboardInterrupt:
+        print("\norca-init cancelled. Projects not reached were not changed.", flush=True)
+        sys.exit(130)
     failed = [tilde(os.path.realpath(os.path.expanduser(p))) for p, ok in results.items()
               if not ok]
-    print(f"\nDone: {len(results) - len(failed)} ok, {len(failed)} failed"
-          + (f": {', '.join(failed)}" if failed else ""))
+    print(f"\nDone in {elapsed_text(time.time() - started)}: {len(results) - len(failed)} ok, "
+          f"{len(failed)} failed" + (f": {', '.join(failed)}" if failed else ""))
     sys.exit(1 if failed else 0)
 
 

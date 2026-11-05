@@ -19,6 +19,30 @@
 
 : ${ORCA_PIPELINE_DIR:=$HOME/orca-pipeline}
 
+# Stops with a hint when Orca says it is down. Runs before the branch step, so a closed Orca
+# does not leave the checkout on a new branch with no pipeline running. Fail-open: an answer
+# it does not recognise counts as up.
+_orca_dev_orca_up() {
+  if (( ! ($+commands[orca] + $+functions[orca]) )); then
+    print -u2 -- "orca-dev: the orca CLI is not in your PATH. Nothing was changed."; return 1
+  fi
+  orca status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+result = data.get("result") or {}
+app = result.get("app") or {}
+runtime = result.get("runtime") or {}
+if not data.get("ok") or app.get("running") is False or runtime.get("reachable") is False:
+    sys.exit(1)
+' || {
+    print -u2 -- "orca-dev: Orca is not running. Open the Orca app (or run: orca open), then run the same command again. Nothing was changed."
+    return 1
+  }
+}
+
 # Prints "ok" or the error from an `orca ... --json` reply on stdin.
 _orca_dev_report() {
   python3 -c '
@@ -29,7 +53,10 @@ try:
 except ValueError:
     sys.exit("orca: " + raw.strip()[:500])
 if not data.get("ok"):
-    sys.exit("orca failed: " + json.dumps(data.get("error") or data)[:500])
+    err = data.get("error") or {}
+    if isinstance(err, dict) and err.get("code") == "runtime_unavailable":
+        sys.exit("Orca is not running. Open the Orca app (or run: orca open), then run the same command again.")
+    sys.exit("orca failed: " + json.dumps(err or data)[:500])
 print("ok: coordinator tab started in Orca")
 '
 }
@@ -321,6 +348,7 @@ orca-dev() {
     esac
   done
 
+  _orca_dev_orca_up || return 1
   if [[ -n $branch_step ]]; then
     _orca_dev_branch $dir $type/$slug $base $dry || return 1
   fi
