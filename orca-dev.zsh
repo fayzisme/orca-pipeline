@@ -165,8 +165,11 @@ Options (after the task, on the same line; end a line with \\ to continue it)
 
 Gates (in the coordinator tab)
   after the plan:  y = continue, r <notes> = revise, q = quit
+                   (only when the plan is finished; if not, you get: r = start again, q = quit)
+  workers still running at the time limit:  w = keep waiting, q = stop waiting
   after review PASS (ship): y = commit+push+PR, w = also follow the PR review,
                             n = stop; y and w then need the word: push
+A worker that stops at a prompt (approval or question) waits for you in its own tab.
 
 Examples
   orca-dev my-app fix invoice-rounding "Invoice totals round the wrong way" --e2e --module reports

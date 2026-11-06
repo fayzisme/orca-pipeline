@@ -268,6 +268,17 @@ The coordinator runs in an Orca terminal tab and works through four stages.
    - `r <notes>` to have Claude revise the plan.
    - `q` to stop.
 
+   The plan gate appears only when the plan is finished: the worker reported
+   success, and `docs/plans/<slug>.md` exists, isn't empty, and was written by
+   this attempt (a plan left from an earlier run doesn't count). The line shows
+   how long the plan is.
+
+   If the plan isn't finished, you don't get that prompt, because there is
+   nothing to approve. You see why (the worker failed, stopped without
+   reporting, or wrote no plan file) and choose:
+   - `r` to start the plan worker again (`r <notes>` adds notes).
+   - `q` to stop.
+
 2. **Implement (OpenCode).** OpenCode implements the plan, runs the tests the
    plan names, and reports the test runner's summary lines. For a bug fix, it
    also reports the failing run from before the fix.
@@ -291,6 +302,22 @@ The coordinator runs in an Orca terminal tab and works through four stages.
    - `n` to stop and commit by hand.
 
    After `y` or `w`, you also type `push`. Anything else cancels.
+
+A worker can also stop at a prompt that needs a person, such as a permission
+request or a question in its own tab. That isn't a failure: Orca keeps the work
+open. The coordinator tells you which worker waits and keeps waiting, and the
+board card gets an unread dot. Answer in that worker's tab (or read what it
+shows with `orca orchestration worker-read --dispatch <id>`, which the notice
+prints). The notice repeats at most every 5 minutes.
+
+If workers are still running when `stage_timeout_min` passes, the coordinator
+asks instead of giving up:
+- `w` to keep waiting for another `stage_timeout_min`.
+- `q` to stop waiting. A plan that isn't finished then leads to the prompt
+  above; an implement worker is stopped before you decide whether to review.
+
+Restarting the plan worker stops the old one first, so two workers never write
+the same plan file.
 
 While a worker runs, it may ask the coordinator a question. The coordinator
 shows it in the tab and waits for your answer. You can answer in three ways:
@@ -330,6 +357,7 @@ is a full example for a Laravel application that runs in Docker.
 | `agent_profiles` | Optional. Agent profiles for this project only, added to `agents.json` and `agents.local.json`. |
 | `modes` | Named skill sets, each with a `plan`, `implement`, and `review` list. |
 | `gates.after_plan`, `gates.after_failure`, `gates.before_fix` | Which approval points are on. |
+| `gates.on_timeout` | On by default. When workers are still running at `stage_timeout_min`, ask whether to keep waiting. Set `false` to give up at the time limit, as older versions did. Without a terminal, it never asks. |
 | `answer_questions` | `"ask_me"` to answer worker questions yourself, or `"auto"`. |
 | `question_timeout_min` | Minutes a worker question waits for you. Default 15. |
 | `stage_timeout_min`, `max_fix_rounds` | How long a stage may take, and how many fix rounds run. Defaults: 45 and 2. |
@@ -634,7 +662,8 @@ The pipeline writes these files inside each project:
 | `runtime_unavailable` or `Could not read Orca runtime metadata` | The same cause: the `orca` CLI can't find a running Orca. Open Orca and retry. |
 | `orca-dev: command not found` | Add the `source` line to `~/.zshrc`, then open a new terminal or run `source ~/.zshrc`. |
 | `Could not switch to <branch>` | Your local changes conflict with the new branch. Commit, stash, or move them, or use `--no-branch`. |
-| A worker waits for approval in its tab | Some agents ask before they run certain commands, such as Docker. Answer in that worker's tab. |
+| The coordinator says a worker "stopped at a prompt that needs you" | The worker waits for an approval or a question, for example before it runs Docker. Open that worker's tab in Orca and answer there. The coordinator keeps waiting and goes on by itself afterwards. |
+| `Plan not finished: ...` instead of the plan prompt | The plan worker failed, stopped without reporting, or wrote no plan file. Read the reason, then answer `r` to start it again or `q` to stop. |
 | The review fails only because evidence is missing | Check the implementer's report in the log. Answer the reviewer's question, or rerun with `--start-at review`. |
 | `validate_config.py` says a skill isn't visible | Install the skill where that agent looks (see the skill folders table), or remove it from the mode. |
 | A stage times out | Raise `stage_timeout_min`, or rerun from that stage with `--start-at`. |

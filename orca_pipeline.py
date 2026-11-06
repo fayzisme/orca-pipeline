@@ -264,6 +264,11 @@ def read_answer(timeout=None):
         print(f"{path} is empty. Type the answer or another @<path>.")
 
 
+def interactive():
+    """True when a person is at the terminal to answer a question."""
+    return sys.stdin.isatty()
+
+
 def ask_human(prompt, choices):
     """Read a choice from the coordinator terminal. Returns (choice, extra text)."""
     while True:
@@ -301,6 +306,8 @@ class Pipeline:
         self.baseline_path = f".orca-pipeline/{self.slug}.baseline.json"
         self.reports = {}  # dispatch -> body of its worker_done message
         self.last_impl_report = ""  # handed to the next review as evidence
+        self.titles = {}   # dispatch -> "title (agent)", for messages to the user
+        self.blocked = {}  # dispatch -> when the user was last told it waits at a prompt
         known = args.known_failures or cfg.get("known_failures") or "none"
         self.base_rules = (
             "No human is watching your terminal: do not wait for approval and do not open "
@@ -327,6 +334,7 @@ class Pipeline:
                     "--worktree", "current", *launch, "--run", self.run_id, "--from", self.me)
         dispatch = find_key(data.get("result") or {}, "dispatchId")
         log(f"started {label} for '{title}': dispatch={dispatch}")
+        self.titles[dispatch] = f"{title} ({label})"
         return dispatch
 
     def answer_question(self, message):
@@ -372,14 +380,25 @@ class Pipeline:
             log(f"board update failed (ignored): {' '.join(set_args[4:])}")
 
     def wait_all(self, dispatches, timeout=None):
-        """Wait until every dispatch in `dispatches` reports. Returns {dispatch: outcome}."""
+        """Wait until every dispatch in `dispatches` reports. Returns {dispatch: outcome}.
+
+        A worker stopped at a prompt for a person (an approval or a question) has neither
+        finished nor failed: the coordinator says where it waits and keeps waiting. When the
+        time limit passes it asks whether to wait longer; "timeout" comes back only when you
+        stop waiting, or when nobody is at the terminal to ask.
+        """
         if DRY_RUN:
             return {d: "succeeded" for d in dispatches}
         pending = set(d for d in dispatches if d)
         results = {}
-        deadline = time.time() + (timeout or self.timeout)
+        limit = timeout or self.timeout
+        deadline = time.time() + limit
         ack = None  # acknowledged on the next check, which also returns the next batch
-        while pending and time.time() < deadline:
+        while pending:
+            if time.time() >= deadline:
+                if not self.keep_waiting(pending, limit):
+                    break
+                deadline = time.time() + limit
             check_args = ["orchestration", "check", "--run", self.run_id, "--wait",
                           "--types", "worker_done,escalation,question", "--timeout-ms", "120000"]
             if ack:
@@ -395,26 +414,67 @@ class Pipeline:
                     continue
                 if mtype not in ("worker_done", "escalation"):
                     continue
-                dispatch = parse_payload(m).get("dispatchId")
+                payload = parse_payload(m)
+                dispatch = payload.get("dispatchId")
                 if dispatch not in pending:
                     log(f"ignoring {mtype} for dispatch {dispatch}")
                     continue
-                outcome = parse_payload(m).get("outcome") or (
+                if mtype == "escalation" and payload.get("stopReason") == "needs-input":
+                    self.note_blocked(dispatch)  # the dispatch is still open: not a result
+                    continue
+                outcome = payload.get("outcome") or (
                     "failed" if mtype == "escalation" else "unknown")
                 results[dispatch] = outcome
                 self.reports[dispatch] = str(m.get("body") or "")
                 pending.discard(dispatch)
+                self.blocked.pop(dispatch, None)
                 log(f"{mtype} {dispatch}: outcome={outcome} | {str(m.get('body'))[:600]}")
             if not messages:
-                log(f"still waiting on {len(pending)} worker(s)...")
+                stuck = len(pending & set(self.blocked))
+                log(f"still waiting on {len(pending)} worker(s)"
+                    + (f" ({stuck} at a prompt that needs you)" if stuck else "") + "...")
         if ack:
             orca("orchestration", "check", "--run", self.run_id, "--ack", ack, check=False)
         for d in pending:
             results[d] = "timeout"
         for d in dispatches:
-            if d and not DRY_RUN:
+            if d and results.get(d) != "timeout":  # a worker that still runs cannot be released
                 orca("orchestration", "worker-release", "--dispatch", d, check=False)
         return results
+
+    def note_blocked(self, dispatch):
+        """A worker stopped at a prompt that needs a person. Say so, at most every 5 minutes."""
+        now = time.time()
+        if now - self.blocked.get(dispatch, 0) < 300:
+            return
+        self.blocked[dispatch] = now
+        title = self.titles.get(dispatch, dispatch)
+        log(f"{title} stopped at a prompt that needs a person (dispatch {dispatch})")
+        self.board(comment=f"{title} waits for you in its tab", unread=True)
+        print(f"\n>>> {title} stopped at a prompt that needs you (an approval or a question).\n"
+              f"    Open its tab in Orca and answer there. The work is not finished, and the\n"
+              f"    coordinator keeps waiting. To see what it shows:\n"
+              f"      {ORCA} orchestration worker-read --dispatch {dispatch}", flush=True)
+
+    def keep_waiting(self, pending, limit):
+        """The time limit passed and workers still run. True when the user wants to wait more."""
+        names = ", ".join(self.titles.get(d, d) for d in sorted(pending))
+        minutes = max(1, int(limit // 60))
+        log(f"time limit of {minutes} min passed; still running: {names}")
+        if not (self.cfg.get("gates", {}).get("on_timeout", True) and interactive()):
+            return False
+        self.board(comment=f"still running after {minutes} min: keep waiting?", unread=True)
+        print(f"\nStill running after {minutes} minutes: {names}")
+        choice, _ = ask_human(f"Keep waiting {minutes} more minutes? 'w' = keep waiting, "
+                              f"'q' = stop waiting", ["w", "q"])
+        return choice == "w"
+
+    def stop_worker(self, dispatch):
+        """Cancel a worker that still runs, so two workers never write the same files."""
+        if dispatch and not DRY_RUN:
+            data = orca("orchestration", "worker-stop", "--dispatch", dispatch, check=False)
+            log(f"stopped {self.titles.get(dispatch, dispatch)}: ok={data.get('ok')}")
+
 
     # ---- git state -----------------------------------------------------
     @staticmethod
@@ -595,19 +655,72 @@ class Pipeline:
             f"URL on the first line of your report. Report --outcome succeeded only then.")
 
     # ---- stages --------------------------------------------------------
+    def plan_stamp(self):
+        """(mtime, size) of the plan file, or None when it does not exist."""
+        try:
+            st = os.stat(self.plan)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def plan_problem(self, outcome, before, dispatch):
+        """Why the plan is not finished, or "" when it is.
+
+        Finished means: the worker reported success, and the plan file exists, is not empty,
+        and was written by this attempt (it differs from `before`, the stamp taken at the
+        start), so a plan left from an earlier run does not count.
+        """
+        if DRY_RUN:
+            return ""
+        if outcome == "timeout":
+            return "the plan worker did not report within the time limit"
+        if outcome != "succeeded":
+            first = (self.reports.get(dispatch) or "").strip().splitlines()[:1]
+            return f"the plan worker reported '{outcome}'" + (f": {first[0][:200]}" if first else "")
+        after = self.plan_stamp()
+        if after is None:
+            return f"the worker reported done, but {self.plan} does not exist"
+        if after == before:
+            return f"the worker reported done, but it did not change {self.plan}"
+        if after[1] == 0:
+            return f"the worker reported done, but {self.plan} is empty"
+        return ""
+
     def stage_plan(self):
         notes = ""
         for attempt in range(1, 6):
+            before = self.plan_stamp()
             self.board("in_progress", f"planning (attempt {attempt})")
             d = self.start("plan", f"plan-{attempt}", self.plan_spec(notes))
             outcome = self.wait_all([d])[d]
-            plan_ok = DRY_RUN or (outcome == "succeeded" and os.path.exists(self.plan))
-            if not plan_ok:
-                log(f"plan stage outcome={outcome}, plan exists={os.path.exists(self.plan)}")
-            if not self.cfg.get("gates", {}).get("after_plan", True) or DRY_RUN:
-                return plan_ok
+            problem = self.plan_problem(outcome, before, d)
+            gate_on = self.cfg.get("gates", {}).get("after_plan", True)
+            if problem:
+                # Never offer "continue to implementation" without a finished plan.
+                log(f"plan not finished: {problem}")
+                if not gate_on:
+                    return False
+                self.board(comment="plan not finished: see the coordinator tab", unread=True)
+                print(f"\nPlan not finished: {problem}.\n"
+                      f"There is nothing to approve yet, so the pipeline does not go on.")
+                choice, extra = ask_human(
+                    "Start the plan worker again? 'r' = start again ('r <notes>' adds notes), "
+                    "'q' = quit", ["r", "q"])
+                if choice == "q":
+                    if outcome == "timeout":
+                        print(f"{self.titles.get(d, d)} is still open in its tab.")
+                    return False
+                if outcome == "timeout":
+                    self.stop_worker(d)  # never two plan workers writing the same file
+                notes = extra
+                continue
+            if not gate_on or DRY_RUN:
+                return True
+            with open(self.plan, errors="replace") as f:
+                size = sum(1 for _ in f)
             self.board(comment=f"plan ready: waiting for your approval ({self.plan})", unread=True)
-            print(f"\nPlan ready: {self.plan}  (open it in your editor before you decide)")
+            print(f"\nPlan ready: {self.plan} ({size} lines; open it in your editor before you "
+                  f"decide)")
             choice, extra = ask_human(
                 "Continue to implementation? 'y' = continue, 'r <notes>' = revise, 'q' = quit",
                 ["y", "r", "q"])
@@ -626,10 +739,12 @@ class Pipeline:
         if outcome == "succeeded":
             return True
         log(f"implement outcome={outcome}")
+        if outcome == "timeout":
+            self.stop_worker(d)  # do not review while the implementer still writes files
         if self.cfg.get("gates", {}).get("after_failure", True) and not DRY_RUN:
-            self.board(comment=f"implement {outcome}: waiting for your decision", unread=True)
-            choice, _ = ask_human("Implement reported failure. Review anyway? 'y' or 'q'",
-                                  ["y", "q"])
+            what = "did not finish in time" if outcome == "timeout" else f"reported '{outcome}'"
+            self.board(comment=f"implement {what}: waiting for your decision", unread=True)
+            choice, _ = ask_human(f"Implement {what}. Review anyway? 'y' or 'q'", ["y", "q"])
             return choice == "y"
         return False
 
