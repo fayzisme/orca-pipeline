@@ -283,7 +283,21 @@ The coordinator runs in an Orca terminal tab and works through four stages.
    plan names, and reports the test runner's summary lines. For a bug fix, it
    also reports the failing run from before the fix.
 
-   If it reports a failure, the **failure gate** asks whether to review anyway.
+   The coordinator compares the working tree before and after, so it knows whether
+   the worker changed any file. If the worker reports a failure, times out, or says
+   it succeeded without changing a file, you see what it said, and:
+   - With changed files, you choose `y` to review what is there, `r` to start the
+     implement worker again (`r <guidance>` passes your answer to it), or `q`.
+   - With no changed files, there is nothing to review, so `y` isn't offered:
+     `r <guidance>` or `q`. If the plan is already implemented, quit and rerun
+     with `--start-at review`.
+
+   The worker is told that you already approved the plan, so it doesn't stop to ask
+   for confirmation, and that a tool this machine lacks (a database tool, an MCP
+   server) is no reason to stop: it does the rest and lists the skipped checks under
+   "Not verified". The plan worker is told which agents will carry out the plan, and
+   to put checks that need other tools under "Manual checks for the user" instead of
+   acceptance criteria.
 
 3. **Review (Codex).** Codex reviews only the lines that changed, runs the
    full test suite once, and writes `docs/reviews/<slug>.md` with a PASS or
@@ -662,6 +676,7 @@ The pipeline writes these files inside each project:
 | `runtime_unavailable` or `Could not read Orca runtime metadata` | The same cause: the `orca` CLI can't find a running Orca. Open Orca and retry. |
 | `orca-dev: command not found` | Add the `source` line to `~/.zshrc`, then open a new terminal or run `source ~/.zshrc`. |
 | `Could not switch to <branch>` | Your local changes conflict with the new branch. Commit, stash, or move them, or use `--no-branch`. |
+| The implement worker stopped and wrote no code | The coordinator shows what the worker said and doesn't offer "review anyway", because there is nothing to review. Answer its question or give guidance with `r <guidance>` (for example: skip the database checks and the notes update, they are done by hand), or quit. |
 | The coordinator says a worker "stopped at a prompt that needs you" | The worker waits for an approval or a question, for example before it runs Docker. Open that worker's tab in Orca and answer there. The coordinator keeps waiting and goes on by itself afterwards. |
 | `Plan not finished: ...` instead of the plan prompt | The plan worker failed, stopped without reporting, or wrote no plan file. Read the reason, then answer `r` to start it again or `q` to stop. |
 | The review fails only because evidence is missing | Check the implementer's report in the log. Answer the reviewer's question, or rerun with `--start-at review`. |

@@ -167,6 +167,8 @@ Gates (in the coordinator tab)
   after the plan:  y = continue, r <notes> = revise, q = quit
                    (only when the plan is finished; if not, you get: r = start again, q = quit)
   workers still running at the time limit:  w = keep waiting, q = stop waiting
+  implement worker stopped:  with changed files y = review anyway, r = start again;
+                             without any: r <guidance> = start again, q = quit
   after review PASS (ship): y = commit+push+PR, w = also follow the PR review,
                             n = stop; y and w then need the word: push
 A worker that stops at a prompt (approval or question) waits for you in its own tab.

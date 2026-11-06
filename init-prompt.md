@@ -105,7 +105,10 @@ unattended: nobody can answer questions, so record open questions in the report 
   --section Decision --max-lines 40` for the ones about tests, runtime, or data safety.
   Mention the runtime constraints (for example Laravel 5.2 / PHP 7 limits) and how to run
   commands (inside the container, or on the host with which binaries). Do not copy
-  rules from the reference that do not apply to this project.
+  rules from the reference that do not apply to this project. The implement, review, e2e,
+  and ship rules are read by other agents that may lack tools only your session has (MCP
+  servers such as database tools, or commands such as `obs` and `gq`). Never make such a
+  tool required there; write "if available" instead.
 
 ## Validate before you finish
 

@@ -33,6 +33,15 @@ ANSWER_FILE = None  # .orca-pipeline/<slug>.answer: answers that do not come fro
 NO_HUMAN_ANSWER = ("No human is available. Choose the simplest option that satisfies the spec "
                    "and the plan, note the assumption in your report, and continue.")
 
+IMPLEMENT_AUTONOMY = (
+    "The user already approved the plan. Do not look for other plans and do not ask for "
+    "confirmation: if a skill says to confirm the plan first, treat it as confirmed and start "
+    "implementing. For a decision that only the user can make, use the orchestration ask command "
+    "and wait for the answer; never end your task with a request for approval. If a step or check "
+    "needs something this environment does not have (a database tool, an MCP server, a command "
+    "that is not installed), do not stop: do everything else, and list each skipped item under "
+    "'Not verified' in your report. Never claim a check you did not run.")
+
 EVIDENCE_RULE = (
     "Report: in your worker report, list each test command you ran with its quoted runner "
     "summary line (for example 'Tests: 15, Assertions: 15, Failures: 3.'). For a bug fix, also "
@@ -428,7 +437,7 @@ class Pipeline:
                 self.reports[dispatch] = str(m.get("body") or "")
                 pending.discard(dispatch)
                 self.blocked.pop(dispatch, None)
-                log(f"{mtype} {dispatch}: outcome={outcome} | {str(m.get('body'))[:600]}")
+                log(f"{mtype} {dispatch}: outcome={outcome} | {str(m.get('body'))[:2000]}")
             if not messages:
                 stuck = len(pending & set(self.blocked))
                 log(f"still waiting on {len(pending)} worker(s)"
@@ -540,11 +549,17 @@ class Pipeline:
             f"{skill_line(self.cfg, self.agents['plan'], self.mode.get('plan', []))}\n"
             f"Write the plan to {self.plan}: goal, files to change, step-by-step tasks, test plan "
             f"(unit tests and an end-to-end check with URL and steps), acceptance criteria.\n"
+            f"{self.agents['implement']} implements the plan and {', '.join(self.agents['review'])} "
+            f"review it. They may not have the tools you have, such as MCP servers (database "
+            f"tools, for example) or helper commands. Write tasks and acceptance criteria they can "
+            f"carry out with files, the shell, and the test command above. Put anything that needs "
+            f"other tools, such as checks against a real database or updates of a notes tool, under "
+            f"a heading 'Manual checks for the user'; those are not acceptance criteria.\n"
             f"Constraints: do NOT write application code. {self.rules('plan')} {self.common}\n"
             f"Ownership: only {self.plan} and planning artifacts the skills create.\n"
             f"Observable acceptance: {self.plan} exists and lists acceptance criteria.")
 
-    def implement_spec(self):
+    def implement_spec(self, notes=""):
         return (
             f"Target: this repository. Read the project rules file first.\n"
             f"Change: implement {self.plan} exactly, including its tests.\n"
@@ -554,6 +569,8 @@ class Pipeline:
             f"names, only the lines the change needs, and write those lines in English. "
             f"{self.rules('implement')} {self.common}\n"
             f"Ownership: source, test, and doc files named in the plan.\n"
+            f"{IMPLEMENT_AUTONOMY}\n"
+            + (f"Notes from the user for this attempt: {notes}\n" if notes else "") +
             f"{EVIDENCE_RULE}\n"
             f"Observable acceptance: the plan's tests pass and every acceptance criterion is met.")
 
@@ -617,6 +634,7 @@ class Pipeline:
             f"the reviewer rewrites them. When a blocking issue asks for evidence, produce it and "
             f"put it in your worker report; the coordinator passes your report to the next review. "
             f"{self.rules('implement')} {self.common}\n"
+            f"{IMPLEMENT_AUTONOMY}\n"
             f"{EVIDENCE_RULE}\n"
             f"Observable acceptance: each blocking issue is addressed and the tests pass.")
 
@@ -675,8 +693,7 @@ class Pipeline:
         if outcome == "timeout":
             return "the plan worker did not report within the time limit"
         if outcome != "succeeded":
-            first = (self.reports.get(dispatch) or "").strip().splitlines()[:1]
-            return f"the plan worker reported '{outcome}'" + (f": {first[0][:200]}" if first else "")
+            return f"the plan worker reported '{outcome}'"
         after = self.plan_stamp()
         if after is None:
             return f"the worker reported done, but {self.plan} does not exist"
@@ -703,6 +720,7 @@ class Pipeline:
                 self.board(comment="plan not finished: see the coordinator tab", unread=True)
                 print(f"\nPlan not finished: {problem}.\n"
                       f"There is nothing to approve yet, so the pipeline does not go on.")
+                self.say_report(d)
                 choice, extra = ask_human(
                     "Start the plan worker again? 'r' = start again ('r <notes>' adds notes), "
                     "'q' = quit", ["r", "q"])
@@ -731,21 +749,78 @@ class Pipeline:
             notes = extra or ask_human("Revision notes", ["r"])[1]
         return False
 
+    def say_report(self, dispatch, limit=1500):
+        """Show what a worker said when it stopped, so the user can decide with the facts."""
+        text = (self.reports.get(dispatch) or "").strip()
+        if text:
+            shown = text if len(text) <= limit else text[:limit].rstrip() + " ..."
+            print("The worker said:\n" + "\n".join("  " + line for line in shown.splitlines()))
+
+    def tree_stamp(self):
+        """{path: (mtime, size)} of every changed or untracked file, not counting plans, reviews,
+        and pipeline files. Two stamps show what a worker changed, even in a file that was
+        already modified before the run."""
+        skip = (self.cfg.get("plan_dir", "docs/plans").rstrip("/") + "/",
+                self.cfg.get("review_dir", "docs/reviews").rstrip("/") + "/", ".orca-pipeline/")
+        stamp = {}
+        for path in self.dirty_paths():
+            if path.startswith(skip):
+                continue
+            try:
+                st = os.stat(path)
+                stamp[path] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                stamp[path] = None  # deleted
+        return stamp
+
+    @staticmethod
+    def changed_between(before, after):
+        missing = object()
+        return sorted(p for p in set(before) | set(after)
+                      if before.get(p, missing) != after.get(p, missing))
+
     def stage_implement(self):
-        self.board("in_progress", "implementing")
-        d = self.start("implement", "implement", self.implement_spec())
-        outcome = self.wait_all([d])[d]
-        self.last_impl_report = self.reports.get(d, "")
-        if outcome == "succeeded":
-            return True
-        log(f"implement outcome={outcome}")
-        if outcome == "timeout":
-            self.stop_worker(d)  # do not review while the implementer still writes files
-        if self.cfg.get("gates", {}).get("after_failure", True) and not DRY_RUN:
-            what = "did not finish in time" if outcome == "timeout" else f"reported '{outcome}'"
+        gate_on = self.cfg.get("gates", {}).get("after_failure", True)
+        notes = ""
+        for attempt in range(1, 4):
+            title = "implement" if attempt == 1 else f"implement-{attempt}"
+            self.board("in_progress", "implementing" + (f" (attempt {attempt})" if attempt > 1 else ""))
+            before = None if DRY_RUN else self.tree_stamp()
+            d = self.start("implement", title, self.implement_spec(notes))
+            outcome = self.wait_all([d])[d]
+            self.last_impl_report = self.reports.get(d, "")
+            if DRY_RUN:
+                return True
+            changed = self.changed_between(before, self.tree_stamp())
+            if outcome == "succeeded" and changed:
+                return True
+            if outcome == "timeout":
+                self.stop_worker(d)  # do not review while the implementer still writes files
+            what = ("reported success but changed no files" if outcome == "succeeded" else
+                    "did not finish in time" if outcome == "timeout" else f"reported '{outcome}'")
+            log(f"implement {what}; files changed: {len(changed)}")
+            if not gate_on:
+                return outcome == "succeeded"
             self.board(comment=f"implement {what}: waiting for your decision", unread=True)
-            choice, _ = ask_human(f"Implement {what}. Review anyway? 'y' or 'q'", ["y", "q"])
-            return choice == "y"
+            print(f"\nThe implement worker {what}.")
+            self.say_report(d)
+            if changed:
+                print(f"{len(changed)} file(s) changed in this attempt, for example: "
+                      f"{', '.join(changed[:5])}")
+                choice, extra = ask_human(
+                    "Review anyway? 'y' = review what is there, 'r' = start the implement worker "
+                    "again ('r <guidance>' adds guidance), 'q' = quit", ["y", "r", "q"])
+            else:
+                print("No files were changed, so there is nothing to review yet. If the plan is "
+                      "already implemented, quit and run again with --start-at review.")
+                choice, extra = ask_human(
+                    "Start the implement worker again? 'r' = start again ('r <answer or guidance>' "
+                    "is passed to it), 'q' = quit", ["r", "q"])
+            if choice == "y":
+                return True
+            if choice == "q":
+                return False
+            notes = extra
         return False
 
     def stage_review(self):
