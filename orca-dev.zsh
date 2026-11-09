@@ -3,6 +3,7 @@
 #
 #   orca-dev <project> <feature|fix|improve|hotfix> <slug> "<task>"
 #            [--mode <mode>] [--no-branch] [orca_pipeline.py flags, e.g. --e2e --dry-run]
+#   orca-dev <project> --resume [<slug>]   continue an unfinished run from its saved state
 #   orca-dev --list
 #   orca-init <project path>... | --all   onboard projects (orca_init.py --help)
 #
@@ -134,6 +135,7 @@ if not project:
 
 Usage
   orca-dev <project> <type> <slug> "<task>" [--mode <mode>] [--no-branch] [pipeline flags]
+  orca-dev <project> --resume [<slug>]   continue an unfinished run (no slug: list them)
   orca-dev <project> --help      modes and skills of that project
   orca-dev --list                projects that have a config
   orca-dev --agents [project]    agent profiles: Orca id, model, CLI, skill folders
@@ -305,16 +307,67 @@ _orca_dev_check_args() {
   return 0
 }
 
+# orca-dev <project> --resume [<slug>]: continue an unfinished run from its state file. Without a
+# slug, lists the unfinished runs of that project.
+_orca_dev_resume() {
+  emulate -L zsh
+  local project=$1 slug=$2 config=$ORCA_PIPELINE_DIR/projects/$1.json
+  if [[ ! -f $config ]]; then
+    print -u2 -- "No config for '$project' ($config)."; return 2
+  fi
+  local target dir
+  target=$(_orca_dev_target $config 2>/dev/null) || return 2
+  dir=${target%%$'\t'*}
+  if [[ -z $slug ]]; then
+    python3 - $dir $project <<'EOF2'
+import glob, json, os, sys
+rows = []
+for path in sorted(glob.glob(os.path.join(sys.argv[1], ".orca-pipeline", "*.state.json"))):
+    try:
+        st = json.load(open(path))
+    except ValueError:
+        continue
+    if st.get("stage") == "done":
+        continue
+    work = len(st.get("active") or {})
+    rows.append(f"  {st.get('slug')}  stage {st.get('stage')}  updated {st.get('updated')}"
+                + (f"  ({work} worker(s) were running)" if work else ""))
+print("Unfinished runs:" if rows else "No unfinished runs in this project.")
+print("\n".join(rows))
+if rows:
+    print("Resume one with: orca-dev " + sys.argv[2] + " --resume <slug>")
+EOF2
+    return 0
+  fi
+  if [[ ! $slug =~ '^[a-z0-9][a-z0-9-]*$' ]]; then
+    print -u2 -- "orca-dev: <slug> '$slug' must be kebab-case."; return 2
+  fi
+  if [[ ! -f $dir/.orca-pipeline/$slug.state.json ]]; then
+    print -u2 -- "orca-dev: no saved state for '$slug' in $dir/.orca-pipeline."
+    print -u2 -- "Runs started before resume existed have none: use --start-at <stage> with the task instead."
+    return 2
+  fi
+  _orca_dev_orca_up || return 1
+  print -- "resume: $slug (branch $(git -C $dir branch --show-current))"
+  local cmd="cd ${(q)dir} && python3 ${(q)ORCA_PIPELINE_DIR}/orca_pipeline.py"
+  cmd+=" --config ${(q)config} --slug ${(q)slug} --resume"
+  orca terminal create --worktree path:$dir --title coord-$slug --focus --json \
+    --command "$cmd" | _orca_dev_report
+}
+
 orca-dev() {
   emulate -L zsh
   local usage='usage: orca-dev <project> <feature|fix|improve|hotfix> <slug> "<task>" [--mode <mode>] [--no-branch] [pipeline flags...]
-       orca-dev --help | orca-dev <project> --help | orca-dev --list | orca-dev --agents [project]'
+       orca-dev <project> --resume [<slug>] | orca-dev --help | orca-dev <project> --help | orca-dev --list | orca-dev --agents [project]'
   local projects=$ORCA_PIPELINE_DIR/projects
   if [[ $1 == (--help|-h|help) ]]; then
     _orca_dev_help ""; return
   fi
   if [[ $2 == (--help|-h|help) ]]; then
     _orca_dev_help $1; return
+  fi
+  if [[ $2 == --resume ]]; then
+    _orca_dev_resume $1 $3; return
   fi
   if [[ $1 == --agents ]]; then
     _orca_dev_agents ${2:-}; return

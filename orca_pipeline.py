@@ -317,6 +317,12 @@ class Pipeline:
         self.last_impl_report = ""  # handed to the next review as evidence
         self.titles = {}   # dispatch -> "title (agent)", for messages to the user
         self.blocked = {}  # dispatch -> when the user was last told it waits at a prompt
+        self.state_path = f".orca-pipeline/{self.slug}.state.json"
+        self.active = {}   # dispatch -> {title, stage, agent}: workers started and not yet settled
+        self.adopt = []    # workers of an earlier coordinator that this one waits for
+        self.adopted = set()  # dispatches taken over from an earlier coordinator
+        self.stage_name = args.start_at
+        self.at_plan_gate = False  # resume: the plan is written and waits for approval
         known = args.known_failures or cfg.get("known_failures") or "none"
         self.base_rules = (
             "No human is watching your terminal: do not wait for approval and do not open "
@@ -325,10 +331,47 @@ class Pipeline:
             f"files. Tests that already fail before this change (out of scope): {known}.")
         self.common = f"Do not commit, push, or switch branches. {self.base_rules}"
 
+    # ---- state for resume ------------------------------------------------
+    def save_state(self):
+        """Write what `--resume` needs to continue after the coordinator dies."""
+        if DRY_RUN:
+            return
+        state = {
+            "slug": self.slug, "feature": self.args.feature, "mode": self.args.mode,
+            "config": os.path.abspath(self.args.config), "e2e": bool(self.args.e2e),
+            "module": self.args.module, "known_failures": self.args.known_failures,
+            "run_id": self.run_id, "stage": self.stage_name, "at_plan_gate": self.at_plan_gate,
+            "active": self.active, "last_impl_report": self.last_impl_report,
+            "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(tmp, self.state_path)
+
+    def enter_stage(self, name):
+        self.stage_name = name
+        self.save_state()
+
+    def take_adopted(self, stage, agent):
+        """A worker of the earlier coordinator for this stage and agent, if one is being awaited."""
+        for i, item in enumerate(self.adopt):
+            if item["stage"] == stage and item.get("agent") == agent:
+                return self.adopt.pop(i)
+        return None
+
     # ---- orca plumbing -------------------------------------------------
     def start(self, stage, title, spec, agent=None):
         """Start one worker. `agent` names a profile; it defaults to the stage's agent."""
         agent = agent or self.agents[stage]
+        taken = self.take_adopted(stage, agent)
+        if taken:
+            log(f"waiting for the earlier worker '{taken['title']}': dispatch={taken['dispatch']}")
+            self.titles[taken["dispatch"]] = taken["title"]
+            self.adopted.add(taken["dispatch"])
+            self.active[taken["dispatch"]] = {k: taken[k] for k in ("title", "stage", "agent")}
+            self.save_state()
+            return taken["dispatch"]
         profile = self.profiles.get(agent, {})
         orca_id = profile.get("orca_id", agent)
         launch = ["--agent", orca_id]
@@ -344,6 +387,8 @@ class Pipeline:
         dispatch = find_key(data.get("result") or {}, "dispatchId")
         log(f"started {label} for '{title}': dispatch={dispatch}")
         self.titles[dispatch] = f"{title} ({label})"
+        self.active[dispatch] = {"title": self.titles[dispatch], "stage": stage, "agent": agent}
+        self.save_state()
         return dispatch
 
     def answer_question(self, message):
@@ -437,6 +482,8 @@ class Pipeline:
                 self.reports[dispatch] = str(m.get("body") or "")
                 pending.discard(dispatch)
                 self.blocked.pop(dispatch, None)
+                self.active.pop(dispatch, None)
+                self.save_state()
                 log(f"{mtype} {dispatch}: outcome={outcome} | {str(m.get('body'))[:2000]}")
             if not messages:
                 stuck = len(pending & set(self.blocked))
@@ -483,6 +530,8 @@ class Pipeline:
         if dispatch and not DRY_RUN:
             data = orca("orchestration", "worker-stop", "--dispatch", dispatch, check=False)
             log(f"stopped {self.titles.get(dispatch, dispatch)}: ok={data.get('ok')}")
+            self.active.pop(dispatch, None)
+            self.save_state()
 
 
     # ---- git state -----------------------------------------------------
@@ -706,12 +755,19 @@ class Pipeline:
     def stage_plan(self):
         notes = ""
         for attempt in range(1, 6):
-            before = self.plan_stamp()
-            self.board("in_progress", f"planning (attempt {attempt})")
-            d = self.start("plan", f"plan-{attempt}", self.plan_spec(notes))
-            outcome = self.wait_all([d])[d]
-            problem = self.plan_problem(outcome, before, d)
             gate_on = self.cfg.get("gates", {}).get("after_plan", True)
+            d = None
+            if self.at_plan_gate and (self.plan_stamp() or (0, 0))[1] > 0:
+                # Resumed while the finished plan waited for approval: no new worker.
+                log("resume: the plan is finished; going to the approval gate")
+                problem = ""
+            else:
+                before = self.plan_stamp()
+                self.board("in_progress", f"planning (attempt {attempt})")
+                d = self.start("plan", f"plan-{attempt}", self.plan_spec(notes))
+                outcome = self.wait_all([d])[d]
+                problem = self.plan_problem(outcome, before, d)
+            self.at_plan_gate = False
             if problem:
                 # Never offer "continue to implementation" without a finished plan.
                 log(f"plan not finished: {problem}")
@@ -736,12 +792,16 @@ class Pipeline:
                 return True
             with open(self.plan, errors="replace") as f:
                 size = sum(1 for _ in f)
+            self.at_plan_gate = True
+            self.save_state()
             self.board(comment=f"plan ready: waiting for your approval ({self.plan})", unread=True)
             print(f"\nPlan ready: {self.plan} ({size} lines; open it in your editor before you "
                   f"decide)")
             choice, extra = ask_human(
                 "Continue to implementation? 'y' = continue, 'r <notes>' = revise, 'q' = quit",
                 ["y", "r", "q"])
+            self.at_plan_gate = False
+            self.save_state()
             if choice == "y":
                 return True
             if choice == "q":
@@ -756,12 +816,15 @@ class Pipeline:
             shown = text if len(text) <= limit else text[:limit].rstrip() + " ..."
             print("The worker said:\n" + "\n".join("  " + line for line in shown.splitlines()))
 
+    def pipeline_prefixes(self):
+        return (self.cfg.get("plan_dir", "docs/plans").rstrip("/") + "/",
+                self.cfg.get("review_dir", "docs/reviews").rstrip("/") + "/", ".orca-pipeline/")
+
     def tree_stamp(self):
         """{path: (mtime, size)} of every changed or untracked file, not counting plans, reviews,
         and pipeline files. Two stamps show what a worker changed, even in a file that was
         already modified before the run."""
-        skip = (self.cfg.get("plan_dir", "docs/plans").rstrip("/") + "/",
-                self.cfg.get("review_dir", "docs/reviews").rstrip("/") + "/", ".orca-pipeline/")
+        skip = self.pipeline_prefixes()
         stamp = {}
         for path in self.dirty_paths():
             if path.startswith(skip):
@@ -792,6 +855,11 @@ class Pipeline:
             if DRY_RUN:
                 return True
             changed = self.changed_between(before, self.tree_stamp())
+            if not changed and d in self.adopted:
+                # The worker wrote its files before this coordinator started: compare with the
+                # baseline of the run instead of the stamp taken a moment ago.
+                paths, _ = self.run_paths()
+                changed = [p for p in (paths or []) if not p.startswith(self.pipeline_prefixes())]
             if outcome == "succeeded" and changed:
                 return True
             if outcome == "timeout":
@@ -907,42 +975,122 @@ class Pipeline:
         log(f"STOP: ship outcome={outcome}. Check git status, git log, and the ship worker tab.")
         return False
 
+    def plan_guard(self, start):
+        """Later stages need the plan; refuse to start them without it."""
+        if start >= 1 and not os.path.isfile(self.plan):
+            sys.exit(f"Cannot start at '{self.args.start_at}': {self.plan} does not exist. "
+                     f"Run the plan stage first (--start-at plan) or restore the plan file.")
+
+    def take_over(self, state):
+        """Resume: bind the old Run to this terminal and decide what happens to its workers."""
+        old = state.get("run_id")
+        data = orca("orchestration", "run-use", "--id", str(old), "--from", self.me, check=False)
+        lost = not data.get("ok")
+        if lost:
+            log(f"run-use {old} failed: {json.dumps(data)[:300]}; starting a new Run")
+            created = orca("orchestration", "run-create", "--objective",
+                           f"{self.cfg.get('project', 'project')}: {self.args.feature}",
+                           "--from", self.me)["result"]
+            self.run_id = find_key(created, "runId") or find_key(created, "id")
+        else:
+            self.run_id = old
+            log(f"took over run {old}")
+        active = state.get("active") or {}
+        if not active:
+            return
+        for d, info in active.items():
+            self.titles[d] = info.get("title", d)
+        names = ", ".join(self.titles[d] for d in active)
+        print(f"\nWorkers that were running when the coordinator stopped: {names}")
+        choice = "s"
+        if not lost and interactive():
+            choice, _ = ask_human(
+                "'w' = wait for them (their result may be queued), 's' = stop them and redo the "
+                "stage, 'q' = quit", ["w", "s", "q"])
+        elif lost:
+            print("The old Run could not be taken over, so their results cannot be collected.")
+        if choice == "q":
+            sys.exit(0)
+        if choice == "s":
+            for d in active:
+                self.stop_worker(d)
+            return
+        own = {"plan": {"plan"}, "implement": {"implement"}, "review": {"review", "e2e"},
+               "ship": {"ship"}}[self.stage_name]
+        later = []
+        for d, info in active.items():
+            item = {"dispatch": d, **info}
+            (self.adopt if info.get("stage") in own else later).append(item)
+        if later:  # for example a fix worker that ran while the stage was review
+            ids = [i["dispatch"] for i in later]
+            for i in later:
+                self.active[i["dispatch"]] = {k: i[k] for k in ("title", "stage", "agent")}
+            log("waiting for " + ", ".join(self.titles[d] for d in ids))
+            results = self.wait_all(ids)
+            for d in ids:
+                if results.get(d) == "timeout":
+                    self.stop_worker(d)
+                elif self.reports.get(d):
+                    self.last_impl_report = self.reports[d]
+
     def run(self):
         stages = ["plan", "implement", "review", "ship"]
+        state = getattr(self.args, "resume_state", None)
         start = stages.index(self.args.start_at)
+        self.plan_guard(start)
         if not DRY_RUN and start <= 1:
             self.save_baseline()
+        if state:
+            self.last_impl_report = state.get("last_impl_report", "")
+            self.at_plan_gate = bool(state.get("at_plan_gate"))
         if not DRY_RUN:
-            if self.args.resume_run:
+            if state:
+                self.take_over(state)
+            elif self.args.resume_run:
                 self.run_id = self.args.resume_run
             else:
                 created = orca("orchestration", "run-create", "--objective",
                                f"{self.cfg.get('project', 'project')}: {self.args.feature}",
                                "--from", self.me)["result"]
                 self.run_id = find_key(created, "runId") or find_key(created, "id")
-            log(f"run={self.run_id} mode={self.args.mode} plan={self.plan}")
+            log(f"run={self.run_id} mode={self.args.mode} plan={self.plan}"
+                + (f" (resumed at {self.args.start_at})" if state else ""))
             base, note = resolve_base(self.cfg)
             log(f"base branch: {base}" + (f" ({note})" if note else ""))
-        if start <= 0 and not self.stage_plan():
-            self.board(comment="STOP: stopped at plan stage", unread=True)
-            log("STOP: stopped at plan gate")
-            return 1
-        if start <= 1 and not self.stage_implement():
-            self.board(comment="STOP: implement did not succeed", unread=True)
-            log("STOP: implement stage did not succeed")
-            return 1
-        if start <= 2 and not self.stage_review():
-            return 1
-        return 0 if self.stage_ship() else 1
+            self.save_state()
+        if start <= 0:
+            self.enter_stage("plan")
+            if not self.stage_plan():
+                self.board(comment="STOP: stopped at plan stage", unread=True)
+                log("STOP: stopped at plan gate")
+                return 1
+        if start <= 1:
+            self.enter_stage("implement")
+            if not self.stage_implement():
+                self.board(comment="STOP: implement did not succeed", unread=True)
+                log("STOP: implement stage did not succeed")
+                return 1
+        if start <= 2:
+            self.enter_stage("review")
+            if not self.stage_review():
+                return 1
+        self.enter_stage("ship")
+        ok = self.stage_ship()
+        if ok:
+            self.enter_stage("done")
+        return 0 if ok else 1
 
 
 def main():
     global LOG_PATH, DRY_RUN, ANSWER_FILE
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", required=True, help="per-project JSON config")
-    ap.add_argument("--feature", required=True, help="feature request in plain words")
+    ap.add_argument("--config", help="per-project JSON config (required unless --resume)")
+    ap.add_argument("--feature", help="feature request in plain words (required unless --resume)")
     ap.add_argument("--slug", required=True, help="short kebab-case name, e.g. quotation-discount")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from .orca-pipeline/<slug>.state.json; task, mode, and stage "
+                         "come from there")
     ap.add_argument("--mode", default="small", help="a key under 'modes' in the config")
     ap.add_argument("--start-at", choices=["plan", "implement", "review", "ship"], default="plan")
     ap.add_argument("--known-failures", help="overrides known_failures from the config")
@@ -954,6 +1102,26 @@ def main():
 
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.slug):
         sys.exit("--slug must be kebab-case: lowercase letters, digits, hyphens")
+    args.resume_state = None
+    if args.resume:
+        path = f".orca-pipeline/{args.slug}.state.json"
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except (OSError, ValueError) as e:
+            sys.exit(f"Cannot resume '{args.slug}': no usable state file {path} ({e}).")
+        if state.get("stage") == "done":
+            sys.exit(f"'{args.slug}' already finished; nothing to resume.")
+        args.resume_state = state
+        args.feature = args.feature or state["feature"]
+        args.config = args.config or state["config"]
+        args.mode = state.get("mode") or args.mode
+        args.e2e = args.e2e or state.get("e2e", False)
+        args.module = args.module or state.get("module")
+        args.known_failures = args.known_failures or state.get("known_failures")
+        args.start_at = state.get("stage") or "plan"
+    if not args.config or not args.feature:
+        sys.exit("--config and --feature are required (or use --resume with the slug).")
     with open(args.config) as f:
         cfg = json.load(f)
     if args.mode not in cfg.get("modes", {}):

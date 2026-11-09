@@ -176,6 +176,7 @@ Creates the task branch, then runs the pipeline in a new Orca tab named
 
 ```text
 orca-dev <project> <type> <slug> "<task>" [--mode <mode>] [--no-branch] [pipeline flags]
+orca-dev <project> --resume [<slug>]   continue an unfinished run (no slug: list them)
 orca-dev <project> --help      modes and skills of that project
 orca-dev --help                full help
 orca-dev --list                projects that have a configuration
@@ -214,6 +215,31 @@ Options:
 | `--start-at <stage>` | Starts at `plan`, `implement`, `review`, or `ship`, to skip finished stages. |
 | `--known-failures "..."` | Names tests that already fail before your change. |
 | `--resume-run <runId>` | Continues an existing run from the same coordinator tab. |
+
+### Resume a run
+
+The coordinator saves `.orca-pipeline/<slug>.state.json` at every stage change.
+It holds the task, the mode, the flags, the stage, the Run, the workers that
+still run, and the implementer's last report. If the coordinator tab closes or
+the machine restarts, continue with:
+
+```text
+orca-dev <project> --resume <slug>
+```
+
+You don't type the task again. The new coordinator tab:
+
+1. takes over the old Run with `orca orchestration run-use`. If Orca refuses,
+   it creates a new Run and stops the old workers;
+2. asks what to do with workers that were running: `w` waits for them (their
+   result may be queued), `s` stops them and redoes the stage, `q` quits;
+3. continues at the saved stage. A finished plan that waited for your approval
+   goes straight back to the approval prompt.
+
+Run `orca-dev <project> --resume` without a slug to list unfinished runs. Runs
+that started before this feature have no state file: use `--start-at` with the
+task. `--start-at implement`, `review`, or `ship` refuses to start when the plan
+file for the slug does not exist.
 
 How the branch step works:
 
@@ -665,7 +691,7 @@ The pipeline writes these files inside each project:
 | --- | --- |
 | `docs/plans/<slug>.md` | No. It's a working document for this run. |
 | `docs/reviews/<slug>.md` | No. It's a working document for this run. |
-| `.orca-pipeline/<slug>.log`, `.baseline.json`, `.answer` | No. Git ignores them through `.git/info/exclude`. |
+| `.orca-pipeline/<slug>.log`, `.baseline.json`, `.state.json`, `.answer` | No. Git ignores them through `.git/info/exclude`. |
 
 ## Troubleshooting
 
@@ -681,6 +707,7 @@ The pipeline writes these files inside each project:
 | `Plan not finished: ...` instead of the plan prompt | The plan worker failed, stopped without reporting, or wrote no plan file. Read the reason, then answer `r` to start it again or `q` to stop. |
 | The review fails only because evidence is missing | Check the implementer's report in the log. Answer the reviewer's question, or rerun with `--start-at review`. |
 | `validate_config.py` says a skill isn't visible | Install the skill where that agent looks (see the skill folders table), or remove it from the mode. |
+| The coordinator tab closed or the machine restarted | Run `orca-dev <project> --resume <slug>`. See "Resume a run". |
 | A stage times out | Raise `stage_timeout_min`, or rerun from that stage with `--start-at`. |
 
 ## Limitations
@@ -689,6 +716,9 @@ The pipeline writes these files inside each project:
   other agent, you set the skill folders and skill sentence in its profile.
 - The coordinator trusts each worker's reported outcome. A PASS means the
   reviewer reported PASS, not that you have verified it.
+- Resume is tested with a stubbed Orca. Whether a worker's result that arrives
+  while no coordinator runs is still delivered after `run-use` is not verified;
+  if it is not, choose `s` to stop the worker and redo the stage.
 - Running the review and end-to-end workers in parallel has only been tested
   with stubbed workers. Real runs so far used one worker at a time.
 - `orca-init` can't confirm things it isn't allowed to read, such as values in
