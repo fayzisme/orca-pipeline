@@ -64,8 +64,10 @@ NUDGE_BODY = (
 # agent cannot continue because its account ran out of tokens, credits, or quota.
 LIMIT_KINDS = {"usagelimitreached", "ratelimited", "ratelimit", "quotaexceeded", "outofcredits",
                "insufficientquota", "billing"}
-LIMIT_TEXT = re.compile(r"usage limit|out of credits|rate.?limit|quota|credit balance|"
-                        r"token limit|insufficient (credit|fund)|billing", re.I)
+LIMIT_TEXT = re.compile(
+    r"usage limit|out of credits|rate.?limit|quota|credit balance|token limit|billing|"
+    r"insufficient (credit|fund)|limit (reached|exceeded|will reset)|hit your (\w+ )?limit|"
+    r"exceeded .{0,40}limit|too many requests|\b429\b|overloaded|resets? at \d", re.I)
 
 HANDOFF_NOTE = (
     "\n\nHandoff: the worker before you ({old}) stopped because it hit a usage limit, possibly "
@@ -340,7 +342,9 @@ def is_limit(message, payload):
     kind = str(payload.get("failureKind") or "").replace("_", "").replace("-", "").lower()
     if kind in LIMIT_KINDS:
         return True
-    if payload.get("turnOutcome") == "failure" or payload.get("failureKind"):
+    subject = str(message.get("subject") or "")
+    if (payload.get("turnOutcome") == "failure" or payload.get("failureKind")
+            or subject.lower().startswith("agent hit an error")):
         text = f"{message.get('subject') or ''} {message.get('body') or ''}"
         return bool(LIMIT_TEXT.search(text))
     return False
