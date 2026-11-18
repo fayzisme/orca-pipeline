@@ -60,6 +60,18 @@ NUDGE_BODY = (
     "--outcome succeeded if the work is finished, or --outcome failed and the reason if it is "
     "not. Do not redo the work.")
 
+# An escalation whose failureKind is one of these (or whose text matches LIMIT_TEXT) means the
+# agent cannot continue because its account ran out of tokens, credits, or quota.
+LIMIT_KINDS = {"usagelimitreached", "ratelimited", "ratelimit", "quotaexceeded", "outofcredits",
+               "insufficientquota", "billing"}
+LIMIT_TEXT = re.compile(r"usage limit|out of credits|rate.?limit|quota|credit balance|"
+                        r"token limit|insufficient (credit|fund)|billing", re.I)
+
+HANDOFF_NOTE = (
+    "\n\nHandoff: the worker before you ({old}) stopped because it hit a usage limit, possibly "
+    "after changing files. Run `git status` and `git diff` first, keep what is correct, and "
+    "continue from there. Do not start over.")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Which agent runs each stage when the config does not say. "review" may also be a list of
@@ -323,6 +335,17 @@ def ask_human(prompt, choices):
         print(f"Type one of: {', '.join(choices)}")
 
 
+def is_limit(message, payload):
+    """True when an escalation says the agent ran out of tokens, credits, or quota."""
+    kind = str(payload.get("failureKind") or "").replace("_", "").replace("-", "").lower()
+    if kind in LIMIT_KINDS:
+        return True
+    if payload.get("turnOutcome") == "failure" or payload.get("failureKind"):
+        text = f"{message.get('subject') or ''} {message.get('body') or ''}"
+        return bool(LIMIT_TEXT.search(text))
+    return False
+
+
 class Pipeline:
     def __init__(self, cfg, args):
         self.cfg = cfg
@@ -354,6 +377,7 @@ class Pipeline:
         self.titles = {}   # dispatch -> "title (agent)", for messages to the user
         self.blocked = {}  # dispatch -> when the user was last told it waits at a prompt
         self.state_path = f".orca-pipeline/{self.slug}.state.json"
+        self.rebuild = {}  # dispatch -> {stage, title, agent, build}: how to restart it elsewhere
         self.nudges = {}   # dispatch -> reminders sent after the worker ended without reporting
         self.active = {}   # dispatch -> {title, stage, agent}: workers started and not yet settled
         self.adopt = []    # workers of an earlier coordinator that this one waits for
@@ -400,9 +424,14 @@ class Pipeline:
         return None
 
     # ---- orca plumbing -------------------------------------------------
-    def start(self, stage, title, spec, agent=None):
-        """Start one worker. `agent` names a profile; it defaults to the stage's agent."""
+    def start(self, stage, title, spec, agent=None, build=None, note=""):
+        """Start one worker. `agent` names a profile; it defaults to the stage's agent.
+
+        `build(agent)` rebuilds the spec for another agent, so a worker that hits a usage limit
+        can be handed to a different one; `note` is appended to the spec after a handoff."""
         agent = agent or self.agents[stage]
+        if build:
+            spec = build(agent) + note
         taken = self.take_adopted(stage, agent)
         if taken:
             log(f"waiting for the earlier worker '{taken['title']}': dispatch={taken['dispatch']}")
@@ -427,6 +456,8 @@ class Pipeline:
         log(f"started {label} for '{title}': dispatch={dispatch}")
         self.titles[dispatch] = f"{title} ({label})"
         self.active[dispatch] = {"title": self.titles[dispatch], "stage": stage, "agent": agent}
+        if build:
+            self.rebuild[dispatch] = {"stage": stage, "title": title, "agent": agent, "build": build}
         self.save_state()
         return dispatch
 
@@ -483,6 +514,7 @@ class Pipeline:
         if DRY_RUN:
             return {d: "succeeded" for d in dispatches}
         pending = set(d for d in dispatches if d)
+        track = {d: d for d in pending}  # current dispatch -> the one the caller knows
         results = {}
         limit = timeout or self.timeout
         deadline = time.time() + limit
@@ -515,13 +547,21 @@ class Pipeline:
                 if mtype == "escalation" and payload.get("stopReason") == "needs-input":
                     self.note_blocked(dispatch)  # the dispatch is still open: not a result
                     continue
+                if mtype == "escalation" and is_limit(m, payload):
+                    new = self.handoff(dispatch, m)
+                    if new:  # the user chose another agent: keep waiting on its worker
+                        pending.discard(dispatch)
+                        pending.add(new)
+                        track[new] = track.pop(dispatch)
+                        deadline = time.time() + limit
+                        continue
                 if mtype == "escalation" and payload.get("stopReason") == "finished" \
                         and self.nudge_worker(dispatch):
                     continue  # told the worker to report; the dispatch is still open
                 outcome = payload.get("outcome") or (
                     "failed" if mtype == "escalation" else "unknown")
-                results[dispatch] = outcome
-                self.reports[dispatch] = str(m.get("body") or "")
+                results[track[dispatch]] = outcome
+                self.reports[dispatch] = self.reports[track[dispatch]] = str(m.get("body") or "")
                 pending.discard(dispatch)
                 self.blocked.pop(dispatch, None)
                 self.active.pop(dispatch, None)
@@ -534,11 +574,63 @@ class Pipeline:
         if ack:
             orca("orchestration", "check", "--run", self.run_id, "--ack", ack, check=False)
         for d in pending:
-            results[d] = "timeout"
-        for d in dispatches:
-            if d and results.get(d) != "timeout":  # a worker that still runs cannot be released
-                orca("orchestration", "worker-release", "--dispatch", d, check=False)
+            results[track[d]] = "timeout"
+        for cur, orig in track.items():
+            if results.get(orig) != "timeout":  # a worker that still runs cannot be released
+                orca("orchestration", "worker-release", "--dispatch", cur, check=False)
         return results
+
+    def handoff(self, dispatch, message):
+        """A worker stopped because its agent hit a usage limit. Tell the user and ask which agent
+        takes over. Returns the new dispatch, or None (nobody to ask, or the user gave up), in
+        which case the caller treats the worker as failed."""
+        info = self.rebuild.get(dispatch)
+        title = self.titles.get(dispatch, dispatch)
+        reason = str(message.get("body") or message.get("subject") or "").strip()
+        log(f"{title} hit a usage limit: {reason[:400]}")
+        if not info or DRY_RUN or not interactive():
+            return None
+        old, stage = info["agent"], info["stage"]
+        reviewers = self.agents["review"] if stage == "review" else []
+        options = [a for a in self.known_agents() if a != old and a not in reviewers]
+        self.board(comment=f"{title}: {old} hit a usage limit; choose another agent", unread=True)
+        print(f"\n>>> {title}: the agent '{old}' stopped because it hit a usage limit "
+              f"(tokens, credits, or quota).\n    Orca said: {reason[:300]}\n"
+              f"    Hand this stage to another agent, wait until the limit resets, or stop.\n"
+              f"    Other agents: {', '.join(options) or 'none known'}", flush=True)
+        while True:
+            choice, extra = ask_human(
+                "'s <agent>' = hand off to that agent, 'r' = try the same agent again, "
+                "'q' = stop", ["s", "r", "q"])
+            if choice == "q":
+                return None
+            new = old if choice == "r" else extra.split()[0] if extra.split() else ""
+            if choice == "s" and (not AGENT_NAME.fullmatch(new) or new == old or new in reviewers):
+                print(f"Name another agent, for example: s {options[0] if options else 'claude'}")
+                continue
+            break
+        orca("orchestration", "worker-stop", "--dispatch", dispatch, check=False)
+        self.active.pop(dispatch, None)
+        self.rebuild.pop(dispatch, None)
+        if new != old:
+            if stage == "review":
+                self.agents["review"] = [new if a == old else a for a in self.agents["review"]]
+                self.reviews[new] = self.reviews.pop(old)
+            else:
+                self.agents[stage] = new
+            self.args.agent_overrides[stage] = self.agents[stage]  # resume keeps the new agent
+        log(f"handoff: {title} from {old} to {new}")
+        return self.start(stage, info["title"], None, new, build=info["build"],
+                          note=HANDOFF_NOTE.format(old=old) if stage == "implement" else "")
+
+    def known_agents(self):
+        """Agent names the user can pick: profiles plus the agents already used in this run."""
+        names = list(self.profiles)
+        for value in self.agents.values():
+            for a in value if isinstance(value, list) else [value]:
+                if a not in names:
+                    names.append(a)
+        return names
 
     def nudge_worker(self, dispatch):
         """The worker ended its turn without worker_done, but its dispatch is still open (it often
@@ -824,7 +916,7 @@ class Pipeline:
             else:
                 before = self.plan_stamp()
                 self.board("in_progress", f"planning (attempt {attempt})")
-                d = self.start("plan", f"plan-{attempt}", self.plan_spec(notes))
+                d = self.start("plan", f"plan-{attempt}", None, build=lambda a, n=notes: self.plan_spec(n))
                 outcome = self.wait_all([d])[d]
                 problem = self.plan_problem(outcome, before, d)
             self.at_plan_gate = False
@@ -909,7 +1001,7 @@ class Pipeline:
             title = "implement" if attempt == 1 else f"implement-{attempt}"
             self.board("in_progress", "implementing" + (f" (attempt {attempt})" if attempt > 1 else ""))
             before = None if DRY_RUN else self.tree_stamp()
-            d = self.start("implement", title, self.implement_spec(notes))
+            d = self.start("implement", title, None, build=lambda a, n=notes: self.implement_spec(n))
             outcome = self.wait_all([d])[d]
             self.last_impl_report = self.reports.get(d, "")
             if DRY_RUN:
@@ -954,9 +1046,9 @@ class Pipeline:
     def stage_review(self):
         e2e_on = self.args.e2e or self.cfg.get("e2e", {}).get("enabled", False)
         max_rounds = self.cfg.get("max_fix_rounds", 2)
-        reviewers = self.agents["review"]
         reports = ", ".join(self.reviews.values())
         for round_no in range(max_rounds + 1):
+            reviewers = list(self.agents["review"])  # a handoff may have replaced one
             self.board("in_review", f"review round {round_no + 1}"
                        + (f" ({len(reviewers)} reviewers)" if len(reviewers) > 1 else "")
                        + (" + e2e" if e2e_on else ""))
@@ -964,10 +1056,11 @@ class Pipeline:
             dispatches = {}
             for agent in reviewers:
                 title = f"review-{round_no}" + (f"-{agent}" if len(reviewers) > 1 else "")
-                dispatches[self.start("review", title, self.review_spec(agent), agent)] = \
-                    self.reviews[agent]
+                dispatches[self.start("review", title, None, agent,
+                                      build=lambda a: self.review_spec(a))] = self.reviews[agent]
             if e2e_on:
-                dispatches[self.start("e2e", f"e2e-{round_no}", self.e2e_spec())] = self.e2e_report
+                dispatches[self.start("e2e", f"e2e-{round_no}", None,
+                                      build=lambda a: self.e2e_spec())] = self.e2e_report
             results = self.wait_all(list(dispatches))
             failed = [dispatches[d] for d, o in results.items() if o != "succeeded"]
             if not failed:
@@ -985,7 +1078,8 @@ class Pipeline:
                 if choice == "q":
                     return False
             self.board(comment=f"review FAIL: fix round {round_no + 1}")
-            d = self.start("implement", f"fix-{round_no + 1}", self.fix_spec(failed))
+            d = self.start("implement", f"fix-{round_no + 1}", None,
+                           build=lambda a, f=failed: self.fix_spec(f))
             self.wait_all([d])
             self.last_impl_report = self.reports.get(d, "") or self.last_impl_report
         self.board(comment=f"STOP: review did not pass, read {reports}", unread=True)
@@ -1021,7 +1115,7 @@ class Pipeline:
                 return True
             follow = choice == "w"
         self.board(comment="shipping: commit, push, PR" + (" + review" if follow else ""))
-        d = self.start("ship", "ship", self.ship_spec(follow))
+        d = self.start("ship", "ship", None, build=lambda a: self.ship_spec(follow))
         timeout = ship.get("timeout_min", 90 if follow else 30) * 60
         outcome = self.wait_all([d], timeout)[d]
         first_line = (self.reports.get(d) or "").strip().splitlines()[:1]

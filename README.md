@@ -535,6 +535,26 @@ orca-dev <project> <type> <slug> "<task>" \
   already runs for the old agent is not adopted; choose `s` at the resume
   prompt to start it again with the new agent.
 
+### When an agent hits its usage limit
+
+If a worker stops because its agent ran out of tokens, credits, or quota (Orca reports
+`failureKind: usageLimitReached` or similar), the coordinator does not fail the stage. It tells
+you which agent stopped and asks:
+
+```text
+'s <agent>' = hand off to that agent, 'r' = try the same agent again, 'q' = stop
+```
+
+- `s claude` starts a new worker for the same stage with that agent. The stage's agent is
+  replaced for the rest of the run (later fix rounds use it too) and saved in the state file,
+  so `--resume` keeps it.
+- A replacement implementer is told to read `git status` and `git diff` first and continue the
+  work the limited agent left, not start over.
+- A reviewer can be replaced by an agent that is not already reviewing. It writes the same
+  report file.
+- `r` starts the same agent again, for when the limit has reset. `q` fails the stage as before.
+- With nobody at the terminal, the worker is treated as failed.
+
 ### Several reviewers
 
 Give `agents.review` a list:
@@ -735,6 +755,7 @@ The pipeline writes these files inside each project:
 | The implement worker stopped and wrote no code | The coordinator shows what the worker said and doesn't offer "review anyway", because there is nothing to review. Answer its question or give guidance with `r <guidance>` (for example: skip the database checks and the notes update, they are done by hand), or quit. |
 | The coordinator says a worker "stopped at a prompt that needs you" | The worker waits for an approval or a question, for example before it runs Docker. Open that worker's tab in Orca and answer there. The coordinator keeps waiting and goes on by itself afterwards. |
 | The log says a worker "ended its turn without worker_done; reminded it" | The worker finished its turn but never ran the finish command (some models print it in a code block instead). The coordinator sends it up to two reminders to run the command, then treats the worker as failed. Every spec also states that the command must be run with the shell tool. |
+| The coordinator says an agent "hit a usage limit" | The agent's account is out of tokens, credits, or quota. Answer `s <agent>` to hand the stage to another agent, `r` to retry after the limit resets, or `q` to stop. |
 | `Plan not finished: ...` instead of the plan prompt | The plan worker failed, stopped without reporting, or wrote no plan file. Read the reason, then answer `r` to start it again or `q` to stop. |
 | The review fails only because evidence is missing | Check the implementer's report in the log. Answer the reviewer's question, or rerun with `--start-at review`. |
 | `validate_config.py` says a skill isn't visible | Install the skill where that agent looks (see the skill folders table), or remove it from the mode. |
