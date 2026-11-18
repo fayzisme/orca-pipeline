@@ -48,6 +48,18 @@ EVIDENCE_RULE = (
     "run the new test once before the fix and quote that failing summary. Keep the report under "
     "3000 characters.")
 
+FINISH_RULE = (
+    "To finish, run the worker_done command from your preamble with your shell tool. Text in "
+    "your reply, even a command inside a code block, never reaches the coordinator. Never end "
+    "your turn without having run it.")
+
+NUDGE_LIMIT = 2  # reminders sent to a worker that ended its turn without reporting
+NUDGE_BODY = (
+    "You ended your turn without sending worker_done. A command printed in a code block is not "
+    "sent. Now run the worker_done command from your preamble with your shell tool: "
+    "--outcome succeeded if the work is finished, or --outcome failed and the reason if it is "
+    "not. Do not redo the work.")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Which agent runs each stage when the config does not say. "review" may also be a list of
@@ -342,6 +354,7 @@ class Pipeline:
         self.titles = {}   # dispatch -> "title (agent)", for messages to the user
         self.blocked = {}  # dispatch -> when the user was last told it waits at a prompt
         self.state_path = f".orca-pipeline/{self.slug}.state.json"
+        self.nudges = {}   # dispatch -> reminders sent after the worker ended without reporting
         self.active = {}   # dispatch -> {title, stage, agent}: workers started and not yet settled
         self.adopt = []    # workers of an earlier coordinator that this one waits for
         self.adopted = set()  # dispatches taken over from an earlier coordinator
@@ -352,7 +365,8 @@ class Pipeline:
             "No human is watching your terminal: do not wait for approval and do not open "
             "interactive prompts; for a blocking question use the orchestration ask command from "
             "your preamble. Never write real credentials, IP addresses, or personal data into "
-            f"files. Tests that already fail before this change (out of scope): {known}.")
+            f"files. Tests that already fail before this change (out of scope): {known}. "
+            f"{FINISH_RULE}")
         self.common = f"Do not commit, push, or switch branches. {self.base_rules}"
 
     # ---- state for resume ------------------------------------------------
@@ -501,6 +515,9 @@ class Pipeline:
                 if mtype == "escalation" and payload.get("stopReason") == "needs-input":
                     self.note_blocked(dispatch)  # the dispatch is still open: not a result
                     continue
+                if mtype == "escalation" and payload.get("stopReason") == "finished" \
+                        and self.nudge_worker(dispatch):
+                    continue  # told the worker to report; the dispatch is still open
                 outcome = payload.get("outcome") or (
                     "failed" if mtype == "escalation" else "unknown")
                 results[dispatch] = outcome
@@ -522,6 +539,24 @@ class Pipeline:
             if d and results.get(d) != "timeout":  # a worker that still runs cannot be released
                 orca("orchestration", "worker-release", "--dispatch", d, check=False)
         return results
+
+    def nudge_worker(self, dispatch):
+        """The worker ended its turn without worker_done, but its dispatch is still open (it often
+        printed the command instead of running it). Remind it, up to NUDGE_LIMIT times. True when
+        a reminder went out and the coordinator should keep waiting."""
+        title = self.titles.get(dispatch, dispatch)
+        sent = self.nudges.get(dispatch, 0)
+        if sent >= NUDGE_LIMIT:
+            log(f"{title} ended its turn without reporting {sent + 1} times; giving up on it")
+            return False
+        data = orca("orchestration", "send", "--from", self.me, "--to", f"dispatch:{dispatch}",
+                    "--subject", "Run worker_done now", "--body", NUDGE_BODY, check=False)
+        if not data.get("ok"):
+            log(f"could not remind {title}: {str(data)[:300]}")
+            return False
+        self.nudges[dispatch] = sent + 1
+        log(f"{title} ended its turn without worker_done; reminded it ({sent + 1}/{NUDGE_LIMIT})")
+        return True
 
     def note_blocked(self, dispatch):
         """A worker stopped at a prompt that needs a person. Say so, at most every 5 minutes."""
