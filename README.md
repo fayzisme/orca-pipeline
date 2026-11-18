@@ -20,7 +20,12 @@ also often skip the project's own test commands, rules, and skills.
 - Runs each task through fixed stages: **plan**, **implement**, **review** (with
   automatic fix rounds), and **ship**.
 - Gives each stage to an agent. By default, Claude Code plans, OpenCode
-  implements, and Codex reviews. Any agent that Orca supports can take any stage.
+  implements, and Codex reviews. Any agent that Orca supports can take any stage,
+  and you can pick the agents per run with `--plan-agent`, `--implement-agent`,
+  and `--review-agent`.
+- Keeps going when things break: a run can be resumed after the coordinator tab
+  closes, a worker that forgets to report is reminded, and a worker whose agent
+  hit its usage limit can be handed to another agent.
 - Tells every agent which skills, test commands, and project rules to use, from
   one configuration file per project.
 - Stops for your approval after the plan, and before anything is committed or
@@ -214,7 +219,16 @@ Options:
 | `--module a,b` | Limits end-to-end checks to these modules from the configuration. |
 | `--start-at <stage>` | Starts at `plan`, `implement`, `review`, or `ship`, to skip finished stages. |
 | `--known-failures "..."` | Names tests that already fail before your change. |
+| `--plan-agent <agent>` | Who writes the spec and plan for this run. |
+| `--implement-agent <agent>` | Who implements, and who gets the fix rounds. |
+| `--review-agent <a,b>` | Who reviews. Several names (comma-separated) review in parallel. |
+| `--e2e-agent <agent>` | Who runs the end-to-end worker (with `--e2e`). |
+| `--ship-agent <agent>` | Who commits, pushes, and opens the PR. |
 | `--resume-run <runId>` | Continues an existing run from the same coordinator tab. |
+
+The agent flags override `agents` in the configuration for that run only. See
+"Choose agents for one run". To continue a run that stopped, use
+`orca-dev <project> --resume <slug>` (see "Resume a run").
 
 ### Resume a run
 
@@ -283,7 +297,9 @@ It reports **errors** and **warnings**:
 
 ## The pipeline in detail
 
-The coordinator runs in an Orca terminal tab and works through four stages.
+The coordinator runs in an Orca terminal tab and works through four stages. The
+agent names in the headings below are the defaults; `agents` in the configuration
+or the `--<stage>-agent` flags change them.
 
 1. **Plan (Claude Code).** Claude writes `docs/plans/<slug>.md` with the goal,
    the files to change, the steps, a test plan, and acceptance criteria. It
@@ -342,6 +358,15 @@ The coordinator runs in an Orca terminal tab and works through four stages.
    - `n` to stop and commit by hand.
 
    After `y` or `w`, you also type `push`. Anything else cancels.
+
+Two kinds of worker trouble are handled before the stage counts as failed:
+
+- **Ended without reporting.** A worker sometimes finishes its turn without running
+  the finish command (it prints the command in a code block instead). Orca leaves
+  the work open, so the coordinator reminds the worker to run it, up to twice.
+- **Usage limit.** If the agent ran out of tokens, credits, or quota, the
+  coordinator tells you and asks for a handoff to another agent (see "When an agent
+  hits its usage limit"). The choice is saved, so a resumed run keeps it.
 
 A worker can also stop at a prompt that needs a person, such as a permission
 request or a question in its own tab. That isn't a failure: Orca keeps the work
@@ -768,9 +793,18 @@ The pipeline writes these files inside each project:
   other agent, you set the skill folders and skill sentence in its profile.
 - The coordinator trusts each worker's reported outcome. A PASS means the
   reviewer reported PASS, not that you have verified it.
-- Resume is tested with a stubbed Orca. Whether a worker's result that arrives
-  while no coordinator runs is still delivered after `run-use` is not verified;
-  if it is not, choose `s` to stop the worker and redo the stage.
+- Resume is tested with a stubbed Orca and with real workers. Whether a worker's
+  result that arrives while no coordinator runs is still delivered after `run-use`
+  is not verified; if it is not, choose `s` to stop the worker and redo the stage.
+- The usage-limit handoff is verified with a real Codex limit at the plan stage and
+  with a stubbed Orca for implement and review. The limit messages of Claude and
+  OpenCode are matched by wording that was not seen from a real run; if a handoff
+  is not offered, the log line of the escalation shows what to add.
+- The reminder to a worker that ended without reporting is verified with a stubbed
+  Orca, and Orca accepts the message from a coordinator terminal. Whether every
+  agent then runs the finish command is not verified.
+- A worker's permission prompt can only be approved in Orca's UI; no CLI command
+  does it. The coordinator waits and tells you which tab needs you.
 - Running the review and end-to-end workers in parallel has only been tested
   with stubbed workers. Real runs so far used one worker at a time.
 - `orca-init` can't confirm things it isn't allowed to read, such as values in
