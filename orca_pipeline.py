@@ -96,6 +96,27 @@ def load_agent_profiles(cfg=None):
     return {name: resolve(name) for name in raw}
 
 
+AGENT_FLAG_STAGES = ("plan", "implement", "review", "e2e", "ship")
+AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def agent_overrides(args, state=None):
+    """{stage: agent} from the --<stage>-agent flags; a resumed run keeps its saved choice
+    for every stage whose flag is absent. "review" is a list when several are named."""
+    found = dict((state or {}).get("agent_overrides") or {})
+    for stage in AGENT_FLAG_STAGES:
+        value = getattr(args, f"{stage}_agent", None)
+        if value is None:
+            continue
+        names = [n.strip() for n in value.split(",") if n.strip()]
+        if not names or not all(AGENT_NAME.fullmatch(n) for n in names):
+            sys.exit(f"--{stage}-agent needs agent names (letters, digits, . _ -): got '{value}'")
+        if stage != "review" and len(names) != 1:
+            sys.exit(f"--{stage}-agent takes one agent; only --review-agent takes a list")
+        found[stage] = names if stage == "review" else names[0]
+    return found
+
+
 def stage_agents(cfg):
     """{stage: agent} from the config over DEFAULT_AGENTS; "review" is always a list."""
     agents = {**DEFAULT_AGENTS, **cfg.get("agents", {})}
@@ -307,6 +328,9 @@ class Pipeline:
                 sys.exit(f"agents.{stage} must name one agent; only agents.review takes a list")
         self.profiles = load_agent_profiles(cfg)
         reviewers = self.agents["review"]
+        if self.agents["implement"] in reviewers:
+            log(f"note: {self.agents['implement']} implements and also reviews; "
+                "a different reviewer gives a more independent check")
         review_dir = cfg.get("review_dir", "docs/reviews")
         # One reviewer keeps <slug>.md; several each get <slug>-<agent>.md.
         self.reviews = {a: self.review if len(reviewers) == 1 else f"{review_dir}/{self.slug}-{a}.md"
@@ -340,6 +364,7 @@ class Pipeline:
             "slug": self.slug, "feature": self.args.feature, "mode": self.args.mode,
             "config": os.path.abspath(self.args.config), "e2e": bool(self.args.e2e),
             "module": self.args.module, "known_failures": self.args.known_failures,
+            "agent_overrides": self.args.agent_overrides,
             "run_id": self.run_id, "stage": self.stage_name, "at_plan_gate": self.at_plan_gate,
             "active": self.active, "last_impl_report": self.last_impl_report,
             "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1098,6 +1123,10 @@ def main():
     ap.add_argument("--e2e", action="store_true", help="run the E2E worker for this run")
     ap.add_argument("--module", help="comma-separated keys of e2e.modules to test, e.g. admin,reports")
     ap.add_argument("--dry-run", action="store_true", help="print specs, start no workers")
+    for stage in AGENT_FLAG_STAGES:
+        ap.add_argument(f"--{stage}-agent", metavar="AGENT",
+                        help=f"agent for the {stage} stage, overriding the config"
+                        + (" (comma-separated: they review in parallel)" if stage == "review" else ""))
     args = ap.parse_args()
 
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.slug):
@@ -1126,6 +1155,9 @@ def main():
         cfg = json.load(f)
     if args.mode not in cfg.get("modes", {}):
         sys.exit(f"--mode must be one of: {', '.join(cfg.get('modes', {}))}")
+    args.agent_overrides = agent_overrides(args, args.resume_state)
+    if args.agent_overrides:
+        cfg["agents"] = {**cfg.get("agents", {}), **args.agent_overrides}
     DRY_RUN = args.dry_run
     if not DRY_RUN and not os.environ.get("ORCA_TERMINAL_HANDLE"):
         sys.exit("Run this inside an Orca terminal (ORCA_TERMINAL_HANDLE is missing).")

@@ -505,6 +505,36 @@ example, plan with a larger model and keep the default model elsewhere:
 The alias launches `--agent claude --model <model id>` and inherits Claude
 Code's skill sentence and skill folders.
 
+### Choose agents for one run
+
+To pick the agents for a single run without editing the config, use one flag
+per stage. A flag overrides `agents` in the config for that run only:
+
+```text
+orca-dev <project> <type> <slug> "<task>" \
+  --plan-agent codex --implement-agent claude --review-agent opencode,codex
+```
+
+| Flag | Stage | Takes |
+| --- | --- | --- |
+| `--plan-agent` | spec and plan | one agent |
+| `--implement-agent` | implementation and fix rounds | one agent |
+| `--review-agent` | review | one agent, or a comma-separated list (parallel review) |
+| `--e2e-agent` | E2E worker (with `--e2e`) | one agent |
+| `--ship-agent` | commit, push, PR | one agent |
+
+- The value is a profile name (`orca-dev --agents` lists them). An agent
+  without a profile still starts with `--agent <name>`.
+- A stage without a flag keeps the config's agent, or the default (Claude Code
+  plans, OpenCode implements, Codex reviews).
+- The coordinator logs a note when the implementer is also a reviewer, because
+  a different reviewer checks the work more independently.
+- The choice is saved in the state file. `--resume` keeps it; pass a flag
+  again with `--resume` to change one stage, for example
+  `orca-dev <project> --resume <slug> --implement-agent codex`. A worker that
+  already runs for the old agent is not adopted; choose `s` at the resume
+  prompt to start it again with the new agent.
+
 ### Several reviewers
 
 Give `agents.review` a list:

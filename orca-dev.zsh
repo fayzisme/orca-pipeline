@@ -131,7 +131,7 @@ USE = {
 }
 if not project:
     print("""orca-dev: create the task branch, then run the multi-agent pipeline
-(plan: Claude Code -> implement: OpenCode -> review: Codex -> ship gate) in an Orca tab.
+(default: plan Claude Code -> implement OpenCode -> review Codex -> ship gate) in an Orca tab;\nany stage can use another agent: --plan-agent, --implement-agent, --review-agent.
 
 Usage
   orca-dev <project> <type> <slug> "<task>" [--mode <mode>] [--no-branch] [pipeline flags]
@@ -158,6 +158,13 @@ Use --mode when the task is one of these:""")
 Options (after the task, on the same line; end a line with \\ to continue it)
   --mode <mode>          skill set for this run (see orca-dev <project> --help)
   --no-branch            stay on the current branch
+  --plan-agent <a>       who writes the spec and plan      (default from config: claude)
+  --implement-agent <a>  who writes the code               (default: opencode)
+  --review-agent <a,b>   who reviews; several run in parallel (default: codex)
+  --e2e-agent <a>        who runs the E2E worker with --e2e
+  --ship-agent <a>       who commits, pushes, and opens the PR
+                         <a> is a profile name (orca-dev --agents). A resumed run keeps its
+                         choice; pass a flag again with --resume to change one stage.
   --dry-run              print every worker spec; start nothing, switch no branch
   --e2e                  also run the end-to-end worker (Codex), next to the review
   --module a,b           E2E only these modules (keys of e2e.modules in the config)
@@ -178,7 +185,8 @@ A worker that stops at a prompt (approval or question) waits for you in its own 
 Examples
   orca-dev my-app fix invoice-rounding "Invoice totals round the wrong way" --e2e --module reports
   orca-dev my-app feature order-form-layout "Tidy the order form layout" --mode ui
-  orca-dev my-app feature order-discount "Add a discount field" --dry-run""")
+  orca-dev my-app feature order-discount "Add a discount field" --dry-run
+  orca-dev my-app feature order-form "Tidy the form" --plan-agent codex --implement-agent claude --review-agent opencode,codex""")
     print("\nProjects: " + (", ".join(names) or "none yet (run orca-init <path>)"))
     sys.exit(0)
 
@@ -312,6 +320,7 @@ _orca_dev_check_args() {
 _orca_dev_resume() {
   emulate -L zsh
   local project=$1 slug=$2 config=$ORCA_PIPELINE_DIR/projects/$1.json
+  local -a extra; extra=("${@:3}")
   if [[ ! -f $config ]]; then
     print -u2 -- "No config for '$project' ($config)."; return 2
   fi
@@ -351,6 +360,7 @@ EOF2
   print -- "resume: $slug (branch $(git -C $dir branch --show-current))"
   local cmd="cd ${(q)dir} && python3 ${(q)ORCA_PIPELINE_DIR}/orca_pipeline.py"
   cmd+=" --config ${(q)config} --slug ${(q)slug} --resume"
+  (( ${#extra} )) && cmd+=" ${(j: :)${(@q)extra}}"
   orca terminal create --worktree path:$dir --title coord-$slug --focus --json \
     --command "$cmd" | _orca_dev_report
 }
@@ -367,7 +377,7 @@ orca-dev() {
     _orca_dev_help $1; return
   fi
   if [[ $2 == --resume ]]; then
-    _orca_dev_resume $1 $3; return
+    _orca_dev_resume $1 "${@:3}"; return
   fi
   if [[ $1 == --agents ]]; then
     _orca_dev_agents ${2:-}; return
